@@ -1,0 +1,266 @@
+import { useEffect, useState } from "react";
+import { Identity } from "spacetimedb";
+import { DbConnection } from "./module_bindings";
+import type {
+  Auction,
+  AuctionResult,
+  Bot,
+  Holding,
+  MatchState,
+  WordPlay,
+} from "./module_bindings/types";
+
+const HOST = import.meta.env.VITE_STDB_HOST ?? "https://maincloud.spacetimedb.com";
+const DB_NAME = import.meta.env.VITE_STDB_DB ?? "wordsmith";
+
+interface Snapshot {
+  match: MatchState | null;
+  bots: Bot[];
+  auction: Auction | null;
+  results: AuctionResult[];
+  holdings: Holding[];
+  plays: WordPlay[];
+  bagRemaining: number;
+}
+
+function snapshot(conn: DbConnection): Snapshot {
+  const match = conn.db.match_state.id.find(0) ?? null;
+  const bots: Bot[] = [];
+  for (const b of conn.db.bot.iter()) bots.push(b);
+  bots.sort((a, b) => Number(b.score - a.score));
+
+  let auction: Auction | null = null;
+  for (const a of conn.db.auction.iter()) {
+    if (a.status.tag === "Open") {
+      auction = a;
+      break;
+    }
+  }
+
+  const results: AuctionResult[] = [];
+  for (const r of conn.db.auction_result.iter()) results.push(r);
+  results.sort((a, b) => Number(b.auctionId - a.auctionId));
+
+  const holdings: Holding[] = [];
+  for (const h of conn.db.holding.iter()) holdings.push(h);
+
+  const plays: WordPlay[] = [];
+  for (const p of conn.db.word_play.iter()) plays.push(p);
+  plays.sort((a, b) => Number(b.id - a.id));
+
+  return {
+    match,
+    bots,
+    auction,
+    results: results.slice(0, 10),
+    holdings,
+    plays: plays.slice(0, 10),
+    bagRemaining: match ? match.bagTotal : 0,
+  };
+}
+
+function rackOf(bot: Identity, holdings: Holding[]): string[] {
+  const tiles: string[] = [];
+  for (const h of holdings) {
+    if (!h.bot.isEqual(bot)) continue;
+    for (let i = 0; i < h.count; i++) tiles.push(h.letter);
+  }
+  tiles.sort();
+  return tiles;
+}
+
+function fmtTimestamp(ts: { __timestamp_micros_since_unix_epoch__: bigint }): number {
+  return Number(ts.__timestamp_micros_since_unix_epoch__) / 1000;
+}
+
+export default function App() {
+  const [conn, setConn] = useState<DbConnection | null>(null);
+  const [state, setState] = useState<Snapshot | null>(null);
+  const [connected, setConnected] = useState(false);
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    const c = DbConnection.builder()
+      .withUri(HOST)
+      .withDatabaseName(DB_NAME)
+      .withToken(localStorage.getItem("wordsmith-token") ?? undefined)
+      .onConnect((conn, _identity, token) => {
+        localStorage.setItem("wordsmith-token", token);
+        setConnected(true);
+        conn
+          .subscriptionBuilder()
+          .onApplied(() => setState(snapshot(conn)))
+          .subscribeToAllTables();
+
+        const refresh = () => setState(snapshot(conn));
+        for (const t of [
+          conn.db.bot,
+          conn.db.auction,
+          conn.db.auction_result,
+          conn.db.holding,
+          conn.db.word_play,
+          conn.db.match_state,
+          conn.db.bag_letter,
+        ]) {
+          const anyT = t as unknown as {
+            onInsert: (cb: () => void) => void;
+            onUpdate: (cb: () => void) => void;
+            onDelete: (cb: () => void) => void;
+          };
+          anyT.onInsert(refresh);
+          anyT.onUpdate(refresh);
+          anyT.onDelete(refresh);
+        }
+      })
+      .onDisconnect(() => setConnected(false))
+      .onConnectError((_ctx, err) => console.error("connect error:", err))
+      .build();
+    setConn(c);
+  }, []);
+
+  // Tick once a second so the countdown updates smoothly.
+  useEffect(() => {
+    const id = window.setInterval(() => setTick((t) => t + 1), 250);
+    return () => window.clearInterval(id);
+  }, []);
+
+  if (!connected || !state) {
+    return (
+      <div className="app">
+        <header>
+          <h1>Wordsmith</h1>
+          <span className="status">connecting to {DB_NAME}…</span>
+        </header>
+      </div>
+    );
+  }
+
+  const now = Date.now();
+  const closesAtMs = state.auction ? fmtTimestamp(state.auction.closesAt) : 0;
+  const msLeft = Math.max(0, closesAtMs - now);
+  const matchStatus = state.match?.status.tag ?? "Lobby";
+
+  return (
+    <div className="app">
+      <header>
+        <h1>Wordsmith</h1>
+        <span className="status">
+          {matchStatus.toLowerCase()} · round {state.match?.currentRound ?? 0} · bag{" "}
+          {state.bagRemaining} left
+          {matchStatus === "Lobby" && (
+            <>
+              {" · "}
+              <button
+                className="button"
+                disabled={!conn || state.bots.length === 0}
+                onClick={() => conn?.reducers.startMatch({})}
+              >
+                Start match
+              </button>
+            </>
+          )}
+        </span>
+      </header>
+
+      <section className="panel">
+        <h2>Current auction</h2>
+        {state.auction ? (
+          <>
+            <div className="auction-letter">{state.auction.letter}</div>
+            <div className="countdown">{(msLeft / 1000).toFixed(2)}s left</div>
+          </>
+        ) : (
+          <div className="countdown">{matchStatus === "Ended" ? "Match ended" : "Waiting…"}</div>
+        )}
+      </section>
+
+      <section className="panel">
+        <h2>Recent auctions</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Letter</th>
+              <th>Winner</th>
+              <th className="num">Bid</th>
+            </tr>
+          </thead>
+          <tbody>
+            {state.results.map((r) => {
+              const winnerBot = r.winner
+                ? state.bots.find((b) => b.identity.isEqual(r.winner!))
+                : null;
+              return (
+                <tr key={String(r.auctionId)}>
+                  <td>{String(r.auctionId)}</td>
+                  <td>{r.letter}</td>
+                  <td>{winnerBot?.name ?? (r.winner ? "—" : "no bid")}</td>
+                  <td className="num">{String(r.winningBid)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </section>
+
+      <section className="panel" style={{ gridColumn: "1 / -1" }}>
+        <h2>Leaderboard</h2>
+        {state.bots.map((b) => {
+          const tiles = rackOf(b.identity, state.holdings);
+          return (
+            <div key={b.identity.toHexString()} className="row">
+              <div>
+                <div className="name">
+                  {b.name} {b.connected ? "" : "(offline)"}
+                </div>
+                <div className="rack">
+                  {tiles.map((t, i) => (
+                    <span key={i} className="tile">
+                      {t}
+                    </span>
+                  ))}
+                  {tiles.length === 0 && <span className="secondary">(no letters yet)</span>}
+                </div>
+              </div>
+              <div>
+                <div style={{ textAlign: "right" }}>{String(b.score)} pts</div>
+                <div className="secondary" style={{ textAlign: "right" }}>
+                  {String(b.balance)} balance
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </section>
+
+      <section className="panel" style={{ gridColumn: "1 / -1" }}>
+        <h2>Words played</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Bot</th>
+              <th>Word</th>
+              <th className="num">Base</th>
+              <th className="num">Bonus</th>
+              <th className="num">Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {state.plays.map((p) => {
+              const bot = state.bots.find((b) => b.identity.isEqual(p.bot));
+              return (
+                <tr key={String(p.id)}>
+                  <td>{bot?.name ?? "?"}</td>
+                  <td>{p.word}</td>
+                  <td className="num">{String(p.baseScore)}</td>
+                  <td className="num">{String(p.bonus)}</td>
+                  <td className="num">{String(p.totalReward)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </section>
+    </div>
+  );
+}

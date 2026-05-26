@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+target/
+Cargo.lock
+.env
+.env.local
+.token-*
+spacetimedb/src/module_bindings/
+web/src/module_bindings/
+bot-starter/src/module_bindings/
