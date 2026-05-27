@@ -5,7 +5,6 @@ import type {
   Auction,
   AuctionResult,
   Bot,
-  Holding,
   MatchState,
   WordPlay,
 } from "./module_bindings/types";
@@ -18,7 +17,8 @@ interface Snapshot {
   bots: Bot[];
   auction: Auction | null;
   results: AuctionResult[];
-  holdings: Holding[];
+  // Reconstructed from public events: identity hex -> letter -> count
+  racks: Map<string, Map<string, number>>;
   plays: WordPlay[];
   bagRemaining: number;
 }
@@ -37,33 +37,50 @@ function snapshot(conn: DbConnection): Snapshot {
     }
   }
 
-  const results: AuctionResult[] = [];
-  for (const r of conn.db.auction_result.iter()) results.push(r);
-  results.sort((a, b) => Number(b.auctionId - a.auctionId));
-
-  const holdings: Holding[] = [];
-  for (const h of conn.db.holding.iter()) holdings.push(h);
+  const allResults: AuctionResult[] = [];
+  for (const r of conn.db.auction_result.iter()) allResults.push(r);
+  allResults.sort((a, b) => Number(a.auctionId - b.auctionId));
 
   const plays: WordPlay[] = [];
   for (const p of conn.db.word_play.iter()) plays.push(p);
-  plays.sort((a, b) => Number(b.id - a.id));
+  plays.sort((a, b) => Number(a.id - b.id));
+
+  // Reconstruct each bot's rack: tiles won minus tiles spent on words.
+  const racks = new Map<string, Map<string, number>>();
+  for (const r of allResults) {
+    if (!r.winner) continue;
+    const key = r.winner.toHexString();
+    const rack = racks.get(key) ?? new Map<string, number>();
+    rack.set(r.letter, (rack.get(r.letter) ?? 0) + 1);
+    racks.set(key, rack);
+  }
+  for (const p of plays) {
+    const key = p.bot.toHexString();
+    const rack = racks.get(key) ?? new Map<string, number>();
+    for (const c of p.word) {
+      rack.set(c, (rack.get(c) ?? 0) - 1);
+    }
+    racks.set(key, rack);
+  }
 
   return {
     match,
     bots,
     auction,
-    results: results.slice(0, 10),
-    holdings,
-    plays: plays.slice(0, 10),
+    results: allResults.slice(-10).reverse(),
+    racks,
+    plays: plays.slice(-10).reverse(),
     bagRemaining: match ? match.bagTotal : 0,
   };
 }
 
-function rackOf(bot: Identity, holdings: Holding[]): string[] {
+function rackTiles(racks: Map<string, Map<string, number>>, bot: Identity): string[] {
+  const rack = racks.get(bot.toHexString());
+  if (!rack) return [];
   const tiles: string[] = [];
-  for (const h of holdings) {
-    if (!h.bot.isEqual(bot)) continue;
-    for (let i = 0; i < h.count; i++) tiles.push(h.letter);
+  for (const [letter, count] of rack.entries()) {
+    if (count <= 0) continue;
+    for (let i = 0; i < count; i++) tiles.push(letter);
   }
   tiles.sort();
   return tiles;
@@ -97,10 +114,8 @@ export default function App() {
           conn.db.bot,
           conn.db.auction,
           conn.db.auction_result,
-          conn.db.holding,
           conn.db.word_play,
           conn.db.match_state,
-          conn.db.bag_letter,
         ]) {
           const anyT = t as unknown as {
             onInsert: (cb: () => void) => void;
@@ -206,7 +221,7 @@ export default function App() {
       <section className="panel" style={{ gridColumn: "1 / -1" }}>
         <h2>Leaderboard</h2>
         {state.bots.map((b) => {
-          const tiles = rackOf(b.identity, state.holdings);
+          const tiles = rackTiles(state.racks, b.identity);
           return (
             <div key={b.identity.toHexString()} className="row">
               <div>

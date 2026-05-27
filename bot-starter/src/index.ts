@@ -56,12 +56,10 @@ let lastWordAttempt = 0;
 const WORD_RETRY_MS = 500;
 
 function rackFor(conn: DbConnection): Map<string, number> {
+  // my_rack is a view that returns only this bot's own letters.
   const rack = new Map<string, number>();
-  if (!myIdentity) return rack;
-  for (const h of conn.db.holding.iter()) {
-    if (h.bot.isEqual(myIdentity)) {
-      rack.set(h.letter, (rack.get(h.letter) ?? 0) + h.count);
-    }
+  for (const h of conn.db.my_rack.iter()) {
+    rack.set(h.letter, (rack.get(h.letter) ?? 0) + h.count);
   }
   return rack;
 }
@@ -119,8 +117,8 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
     if (a.status.tag === "Open") tryBid(conn, a.id, a.letter);
   });
-  conn.db.holding.onInsert(() => tryPlayWord(conn));
-  conn.db.holding.onUpdate(() => tryPlayWord(conn));
+  conn.db.my_rack.onInsert(() => tryPlayWord(conn));
+  conn.db.my_rack.onUpdate(() => tryPlayWord(conn));
 
   conn.db.auction_result.onInsert((_ctx, r) => {
     const winner = r.winner ? r.winner.toHexString().slice(0, 8) : "no-bid";

@@ -6,45 +6,43 @@ Built on [SpacetimeDB](https://spacetimedb.com): the rules, timing, and dictiona
 
 ## Layout
 
-| Directory | What it is |
+The web client lives at the repo root (standard SpacetimeDB project layout); the module is nested inside it.
+
+| Path | What it is |
 |---|---|
-| `spacetimedb/` | Rust SpacetimeDB module — tables, reducers, scheduled auction tick, dictionary |
+| `src/`, `index.html`, `vite.config.ts` | Vite + React spectator UI |
+| `spacetimedb/` | Rust SpacetimeDB module — tables, views, reducers, scheduled auction tick, dictionary |
 | `bot-starter/` | Node + TypeScript starter for a competing bot. Edit `src/strategy.ts` to change behaviour. |
-| `web/` | Vite + React spectator UI |
 
 ## How the game works
 
 - **Auction:** every 1s, the current letter closes and is awarded to the highest bidder. Sealed bids are stored in a private table, so bots cannot snoop on each other.
 - **Tiebreak:** higher amount wins; on equal bids, the earlier submission wins.
 - **Currency:** start at 100. Earn currency by playing words; the reward is `base_score × length_multiplier`, where the multiplier ramps from 1.0× (≤3 letters) up to 3.0× (≥7 letters).
-- **Letters:** standard 98-tile Scrabble bag (no blanks). Match ends when the bag is empty.
+- **Letters:** standard 98-tile Scrabble bag (no blanks). Match ends when the bag is empty. Tiles nobody bids on are returned to the bag.
+- **Visibility:** the `Holding` and `BagLetter` tables are private. Bots get their own rack via the `my_rack` view; nobody can subscribe to the full bag composition or opponents' racks. The spectator UI reconstructs racks from public `AuctionResult` + `WordPlay` events.
 - **Dictionary:** the [ENABLE](https://en.wikipedia.org/wiki/Moby_Project#ENABLE) wordlist (~173k words, public domain) is embedded from `spacetimedb/wordlist.txt`. Swap in TWL or SOWPODS if you have a license.
 
 ## Quick start
 
-1. **Publish the module**
+1. **Publish the module & run the spectator UI** (from repo root):
    ```bash
-   spacetime publish wordsmith --module-path ./spacetimedb
-   ```
-
-2. **Run the spectator UI**
-   ```bash
-   cd web
    npm install
-   npm run generate     # generates module bindings
+   npm run publish     # spacetime publish wordsmith
+   npm run generate    # generates module bindings into src/module_bindings
    npm run dev
    ```
 
-3. **Run one or more bots**
+2. **Run one or more bots** (in another terminal):
    ```bash
    cd bot-starter
    npm install
    npm run generate
    BOT_NAME=alice npm start
    ```
-   In another terminal, start a second bot (`BOT_NAME=bob npm start`) so there's competition.
+   Start a second bot in another terminal (`BOT_NAME=bob npm start`) so there's competition.
 
-4. **Start the match** from the spectator UI ("Start match" button), or call the `start_match` reducer directly.
+3. **Start the match** from the spectator UI ("Start match" button), or call the `start_match` reducer directly.
 
 ## Writing a bot
 

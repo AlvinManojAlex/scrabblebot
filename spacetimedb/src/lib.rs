@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use rand::Rng;
 use spacetimedb::{
-    reducer, table, Identity, ReducerContext, ScheduleAt, SpacetimeType, Table, Timestamp,
+    reducer, table, view, Identity, ReducerContext, ScheduleAt, SpacetimeType, Table, Timestamp,
+    ViewContext,
 };
 
 const STARTING_BALANCE: i64 = 100;
@@ -49,16 +50,17 @@ pub struct MatchState {
     pub ended_at: Option<Timestamp>,
 }
 
-#[table(accessor = bag_letter, public)]
+// Private — bots & spectators see only the total via the `bag_remaining` view.
+#[table(accessor = bag_letter)]
 pub struct BagLetter {
     #[primary_key]
     pub letter: String,
     pub remaining: u32,
 }
 
+// Private — each bot sees only its own rack via the `my_rack` view.
 #[table(
     accessor = holding,
-    public,
     index(accessor = holding_by_bot, btree(columns = [bot]))
 )]
 pub struct Holding {
@@ -133,6 +135,18 @@ pub struct AuctionSchedule {
     #[auto_inc]
     pub scheduled_id: u64,
     pub scheduled_at: ScheduleAt,
+}
+
+// ---------- Views ----------
+// Each bot sees only its own letters; the per-letter bag composition stays
+// hidden. Total tiles remaining is already public via MatchState.bag_total.
+#[view(accessor = my_rack, public)]
+fn my_rack(ctx: &ViewContext) -> Vec<Holding> {
+    ctx.db
+        .holding()
+        .holding_by_bot()
+        .filter(&ctx.sender())
+        .collect()
 }
 
 // ---------- Lifecycle ----------
@@ -470,6 +484,9 @@ pub fn auction_tick(ctx: &ReducerContext, _job: AuctionSchedule) {
                 }
             }
         }
+    } else {
+        // No winning bid — return the tile to the bag.
+        return_to_bag(ctx, &auction.letter);
     }
 
     ctx.db.auction_result().insert(AuctionResult {
@@ -558,4 +575,24 @@ fn draw_letter(ctx: &ReducerContext) -> Option<String> {
         idx -= bag.remaining;
     }
     None
+}
+
+fn return_to_bag(ctx: &ReducerContext, letter: &str) {
+    if let Some(bag) = ctx.db.bag_letter().letter().find(&letter.to_string()) {
+        ctx.db.bag_letter().letter().update(BagLetter {
+            remaining: bag.remaining + 1,
+            letter: bag.letter.clone(),
+        });
+    } else {
+        ctx.db.bag_letter().insert(BagLetter {
+            letter: letter.to_string(),
+            remaining: 1,
+        });
+    }
+    if let Some(m) = ctx.db.match_state().id().find(SINGLETON_MATCH_ID) {
+        ctx.db.match_state().id().update(MatchState {
+            bag_total: m.bag_total + 1,
+            ..m
+        });
+    }
 }

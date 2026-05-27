@@ -1,10 +1,11 @@
 {
-  "name": "wordsmith-web",
+  "name": "wordsmith",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "generate": "spacetime generate --lang typescript --out-dir src/module_bindings --module-path ../spacetimedb",
+    "generate": "spacetime generate --lang typescript --out-dir src/module_bindings --module-path ./spacetimedb",
+    "publish": "spacetime publish wordsmith --module-path ./spacetimedb",
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview"
