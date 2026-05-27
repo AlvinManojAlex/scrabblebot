@@ -15,7 +15,7 @@
   "dependencies": {
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
-    "spacetimedb": "2.0.3"
+    "spacetimedb": "^2.2.0"
   },
   "devDependencies": {
     "@types/react": "^18.3.0",
