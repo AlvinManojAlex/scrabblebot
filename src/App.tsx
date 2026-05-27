@@ -214,6 +214,7 @@ export default function App() {
               <th>Letter</th>
               <th>Winner</th>
               <th className="num">Bid</th>
+              <th className="num">Paid</th>
             </tr>
           </thead>
           <tbody>
@@ -226,7 +227,8 @@ export default function App() {
                   <td>{String(r.auctionId)}</td>
                   <td>{r.letter}</td>
                   <td>{winnerBot?.name ?? (r.winner ? "—" : "no bid")}</td>
-                  <td className="num">{String(r.winningBid)}</td>
+                  <td className="num">{String(r.topBid)}</td>
+                  <td className="num">{String(r.paid)}</td>
                 </tr>
               );
             })}

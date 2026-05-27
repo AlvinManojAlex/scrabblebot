@@ -12,6 +12,8 @@ use spacetimedb::{
 const STARTING_BALANCE: i64 = 100;
 const AUCTION_DURATION_MS: u64 = 1000;
 const SINGLETON_MATCH_ID: u32 = 0;
+// Reserve price for a Vickrey auction with a single bidder.
+const AUCTION_RESERVE: i64 = 1;
 
 #[derive(SpacetimeType, Clone, Debug, PartialEq)]
 pub enum MatchStatus {
@@ -118,7 +120,8 @@ pub struct AuctionResult {
     pub auction_id: u64,
     pub letter: String,
     pub winner: Option<Identity>,
-    pub winning_bid: i64,
+    pub top_bid: i64,    // winner's actual bid (highest)
+    pub paid: i64,       // what they paid (second-highest, or reserve for sole bidder)
     pub closed_at: Timestamp,
 }
 
@@ -494,23 +497,25 @@ pub fn auction_tick(ctx: &ReducerContext, _job: AuctionSchedule) {
         .bid_by_auction()
         .filter(&auction_id)
         .collect();
-    let winner_bid = bids
-        .iter()
-        .filter(|b| b.amount > 0)
-        .max_by(|a, b| a.amount.cmp(&b.amount).then_with(|| b.id.cmp(&a.id)));
+    // Vickrey (second-price) auction. Sort bids descending by amount; ties
+    // broken by earlier submission (lower id). Winner pays the runner-up's
+    // bid, or AUCTION_RESERVE if they're the only bidder.
+    let mut sorted: Vec<&PendingBid> = bids.iter().filter(|b| b.amount > 0).collect();
+    sorted.sort_by(|a, b| b.amount.cmp(&a.amount).then(a.id.cmp(&b.id)));
 
-    let (winner, winning_bid) = match winner_bid {
-        Some(b) => (Some(b.bidder), b.amount),
-        None => (None, 0),
+    let (winner, top_bid, paid) = match sorted.as_slice() {
+        [] => (None, 0, 0),
+        [only] => (Some(only.bidder), only.amount, AUCTION_RESERVE.min(only.amount)),
+        [first, second, ..] => (Some(first.bidder), first.amount, second.amount),
     };
 
     let mut sim_winner: Option<Identity> = None;
     if let Some(w) = winner {
         if let Some(bot) = ctx.db.bot().identity().find(w) {
-            if bot.balance >= winning_bid {
+            if bot.balance >= paid {
                 let is_sim = bot.is_simulated;
                 ctx.db.bot().identity().update(Bot {
-                    balance: bot.balance - winning_bid,
+                    balance: bot.balance - paid,
                     ..bot
                 });
                 // Add letter to winner's rack.
@@ -548,7 +553,8 @@ pub fn auction_tick(ctx: &ReducerContext, _job: AuctionSchedule) {
         auction_id,
         letter: auction.letter.clone(),
         winner,
-        winning_bid,
+        top_bid,
+        paid,
         closed_at: ctx.timestamp,
     });
     ctx.db.auction().id().update(Auction {
@@ -662,14 +668,22 @@ fn return_to_bag(ctx: &ReducerContext, letter: &str) {
 
 // ---------- Simulated-bot logic ----------
 
+// Each sim strategy is meant to *value* a letter differently. Under a Vickrey
+// auction the dominant strategy is to bid your true valuation, so the bots
+// just bid the value they personally assign to the tile.
 fn decide_bid(strategy: &BotStrategy, letter: &str, balance: i64) -> i64 {
     let c = letter.chars().next().unwrap_or('A');
     let value = letters::letter_value(c) as i64;
+    let is_vowel = matches!(c, 'A' | 'E' | 'I' | 'O' | 'U');
     let bid = match strategy {
         BotStrategy::Human => return 0,
-        BotStrategy::Cheapskate => 1,
-        BotStrategy::ValueBidder => value + 1,
-        BotStrategy::Aggressive => value * 2 + 2,
+        // Cheapskate undervalues — face value minus 1, floor 1.
+        BotStrategy::Cheapskate => (value - 1).max(1),
+        // ValueBidder bids exactly face value.
+        BotStrategy::ValueBidder => value,
+        // Aggressive bids face value + premium, with extra for vowels because
+        // they enable more words.
+        BotStrategy::Aggressive => value + if is_vowel { 4 } else { 2 },
     };
     bid.min(balance).max(0)
 }
