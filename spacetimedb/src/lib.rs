@@ -48,6 +48,7 @@ pub enum TournamentStatus {
     Lobby,
     Swiss,
     Bracket,
+    Final,
     Ended,
 }
 
@@ -55,6 +56,7 @@ pub enum TournamentStatus {
 pub enum TournamentPhase {
     Swiss,
     Bracket,
+    Final,
 }
 
 #[derive(SpacetimeType, Clone, Debug, PartialEq)]
@@ -1062,29 +1064,91 @@ fn on_match_ended(ctx: &ReducerContext, match_id: u64) {
             }
         }
         TournamentPhase::Bracket => {
-            // Top half advance; bottom half eliminated.
-            let cutoff = placed.len() / 2;
-            for (idx, p) in placed.iter().enumerate() {
-                if idx >= cutoff {
-                    let entry: Option<TournamentEntry> = ctx
-                        .db
-                        .tournament_entry()
-                        .te_by_tournament()
-                        .filter(t.id)
-                        .find(|e| e.bot == p.bot);
-                    if let Some(e) = entry {
-                        ctx.db.tournament_entry().id().update(TournamentEntry {
-                            eliminated: true,
-                            ..e
-                        });
-                    }
+            // Eliminate only the last-place bot in the match.
+            if let Some(last) = placed.last() {
+                let entry: Option<TournamentEntry> = ctx
+                    .db
+                    .tournament_entry()
+                    .te_by_tournament()
+                    .filter(t.id)
+                    .find(|e| e.bot == last.bot);
+                if let Some(e) = entry {
+                    ctx.db.tournament_entry().id().update(TournamentEntry {
+                        eliminated: true,
+                        ..e
+                    });
                 }
             }
         }
+        TournamentPhase::Final => {
+            // No elimination yet — finals are best-of-3 by aggregate score.
+            // We just record this game and decide after game 3.
+        }
     }
 
-    // Is this round complete? All TournamentMatch rows for this round refer
-    // to Matches that are Ended.
+    // Round-complete check: only relevant for Swiss + Bracket. Finals are
+    // handled inline below.
+    if tm.phase == TournamentPhase::Final {
+        // Count how many Final games have ended so far.
+        let final_games_done = ctx
+            .db
+            .tournament_match()
+            .tm_by_tournament()
+            .filter(t.id)
+            .filter(|m| m.phase == TournamentPhase::Final)
+            .filter(|m| {
+                ctx.db
+                    .match_state()
+                    .id()
+                    .find(m.match_id)
+                    .map(|mm| mm.status == MatchStatus::Ended)
+                    .unwrap_or(false)
+            })
+            .count();
+        if final_games_done < 3 {
+            // Start the next final game.
+            let _ = start_final_game(ctx, t.id, final_games_done as u32 + 1);
+        } else {
+            // All three games done. Aggregate scores across them.
+            let finalists: Vec<Identity> = ctx
+                .db
+                .tournament_entry()
+                .te_by_tournament()
+                .filter(t.id)
+                .filter(|e| !e.eliminated)
+                .map(|e| e.bot)
+                .collect();
+            let mut totals: Vec<(Identity, i64)> = finalists
+                .iter()
+                .map(|b| (*b, aggregate_final_score(ctx, t.id, *b)))
+                .collect();
+            totals.sort_by(|a, b| b.1.cmp(&a.1));
+            // Lowest aggregate is eliminated.
+            if let Some((loser, _)) = totals.last() {
+                let entry: Option<TournamentEntry> = ctx
+                    .db
+                    .tournament_entry()
+                    .te_by_tournament()
+                    .filter(t.id)
+                    .find(|e| e.bot == *loser);
+                if let Some(e) = entry {
+                    ctx.db.tournament_entry().id().update(TournamentEntry {
+                        eliminated: true,
+                        ..e
+                    });
+                }
+            }
+            ctx.db.tournament().id().update(Tournament {
+                status: TournamentStatus::Ended,
+                ended_at: Some(ctx.timestamp),
+                ..t
+            });
+            log::info!("Tournament ended");
+        }
+        return;
+    }
+
+    // Swiss / Bracket: standard round-complete check then advance.
     let round_done = ctx
         .db
         .tournament_match()
@@ -1103,6 +1167,34 @@ fn on_match_ended(ctx: &ReducerContext, match_id: u64) {
         return;
     }
     advance_tournament(ctx, t.id);
+}
+
+fn aggregate_final_score(
+    ctx: &ReducerContext,
+    tournament_id: u64,
+    bot: Identity,
+) -> i64 {
+    let mut total: i64 = 0;
+    let final_matches: Vec<u64> = ctx
+        .db
+        .tournament_match()
+        .tm_by_tournament()
+        .filter(tournament_id)
+        .filter(|m| m.phase == TournamentPhase::Final)
+        .map(|m| m.match_id)
+        .collect();
+    for mid in final_matches {
+        let p = ctx
+            .db
+            .match_participant()
+            .mp_by_match()
+            .filter(mid)
+            .find(|p| p.bot == bot);
+        if let Some(p) = p {
+            total += p.score;
+        }
+    }
+    total
 }
 
 fn advance_tournament(ctx: &ReducerContext, tournament_id: u64) {
@@ -1136,7 +1228,7 @@ fn advance_tournament(ctx: &ReducerContext, tournament_id: u64) {
                     current_round: 0,
                     ..t.clone()
                 });
-                let _ = start_bracket_round(ctx, t.id);
+                let _ = start_elimination_round(ctx, t.id);
             }
         }
         TournamentStatus::Bracket => {
@@ -1153,15 +1245,25 @@ fn advance_tournament(ctx: &ReducerContext, tournament_id: u64) {
                     ended_at: Some(ctx.timestamp),
                     ..t
                 });
+            } else if remaining == 2 {
+                // Transition to the best-of-3 final.
+                ctx.db.tournament().id().update(Tournament {
+                    status: TournamentStatus::Final,
+                    current_round: 0,
+                    ..t.clone()
+                });
+                let _ = start_final_game(ctx, t.id, 1);
             } else {
-                let _ = start_bracket_round(ctx, t.id);
+                let _ = start_elimination_round(ctx, t.id);
             }
         }
         _ => {}
     }
 }
 
-fn start_bracket_round(
+// Spawn a single match containing every still-alive bot. The lowest-scoring
+// bot will be eliminated when this match ends.
+fn start_elimination_round(
     ctx: &ReducerContext,
     tournament_id: u64,
 ) -> Result<(), String> {
@@ -1171,14 +1273,15 @@ fn start_bracket_round(
         .id()
         .find(tournament_id)
         .ok_or("Unknown tournament")?;
-    let entries: Vec<TournamentEntry> = ctx
+    let roster: Vec<Identity> = ctx
         .db
         .tournament_entry()
         .te_by_tournament()
         .filter(t.id)
         .filter(|e| !e.eliminated)
+        .map(|e| e.bot)
         .collect();
-    if entries.len() < 2 {
+    if roster.len() < 2 {
         return Ok(());
     }
     let next_round = t.current_round + 1;
@@ -1186,15 +1289,67 @@ fn start_bracket_round(
         current_round: next_round,
         ..t.clone()
     });
-    // For finals (2 left), reduce match_size to 2 so it's a 1v1.
-    let effective = if entries.len() < t.match_size as usize {
-        let mut t2 = t.clone();
-        t2.match_size = entries.len() as u32;
-        t2
-    } else {
-        t.clone()
-    };
-    pair_into_matches(ctx, &effective, &entries, next_round, TournamentPhase::Bracket)
+    let prev_matches: Vec<u64> = ctx.db.match_state().iter().map(|m| m.id).collect();
+    start_match_with(ctx, t.auction_type.clone(), roster)?;
+    let new_match_id = ctx
+        .db
+        .match_state()
+        .iter()
+        .map(|m| m.id)
+        .filter(|id| !prev_matches.contains(id))
+        .max()
+        .unwrap_or(0);
+    ctx.db.tournament_match().insert(TournamentMatch {
+        id: 0,
+        tournament_id: t.id,
+        match_id: new_match_id,
+        round: next_round,
+        phase: TournamentPhase::Bracket,
+    });
+    Ok(())
+}
+
+fn start_final_game(
+    ctx: &ReducerContext,
+    tournament_id: u64,
+    game_num: u32,
+) -> Result<(), String> {
+    let t = ctx
+        .db
+        .tournament()
+        .id()
+        .find(tournament_id)
+        .ok_or("Unknown tournament")?;
+    let roster: Vec<Identity> = ctx
+        .db
+        .tournament_entry()
+        .te_by_tournament()
+        .filter(t.id)
+        .filter(|e| !e.eliminated)
+        .map(|e| e.bot)
+        .collect();
+    if roster.len() < 2 {
+        return Ok(());
+    }
+    let prev_matches: Vec<u64> = ctx.db.match_state().iter().map(|m| m.id).collect();
+    start_match_with(ctx, t.auction_type.clone(), roster)?;
+    let new_match_id = ctx
+        .db
+        .match_state()
+        .iter()
+        .map(|m| m.id)
+        .filter(|id| !prev_matches.contains(id))
+        .max()
+        .unwrap_or(0);
+    ctx.db.tournament_match().insert(TournamentMatch {
+        id: 0,
+        tournament_id: t.id,
+        match_id: new_match_id,
+        round: game_num,
+        phase: TournamentPhase::Final,
+    });
+    log::info!("Final game {} started for tournament {}", game_num, t.id);
+    Ok(())
 }
 
 // ---------- ELO ----------
