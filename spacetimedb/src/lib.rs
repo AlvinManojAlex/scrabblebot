@@ -11,9 +11,10 @@ use spacetimedb::{
 
 const STARTING_BALANCE: i64 = 100;
 const AUCTION_DURATION_MS: u64 = 1000;
-const SINGLETON_MATCH_ID: u32 = 0;
 // Reserve price for a Vickrey auction with a single bidder.
 const AUCTION_RESERVE: i64 = 1;
+
+// ---------- Enums ----------
 
 #[derive(SpacetimeType, Clone, Debug, PartialEq)]
 pub enum MatchStatus {
@@ -36,56 +37,89 @@ pub enum AuctionType {
 
 #[derive(SpacetimeType, Clone, Debug, PartialEq)]
 pub enum BotStrategy {
-    Human,        // real client bot — module makes no decisions
-    Cheapskate,   // always bids 1
-    ValueBidder,  // bids letter face value + 1
-    Aggressive,   // bids letter value × 2 + 2
+    Human,
+    Cheapskate,
+    ValueBidder,
+    Aggressive,
 }
 
+// ---------- Tables ----------
+
+// Bot — global registration. No per-match state lives here anymore.
 #[table(accessor = bot, public)]
 pub struct Bot {
     #[primary_key]
     pub identity: Identity,
     #[unique]
     pub name: String,
-    pub balance: i64,
-    pub score: i64,
     pub connected: bool,
     pub registered_at: Timestamp,
     pub is_simulated: bool,
     pub strategy: BotStrategy,
 }
 
-#[table(accessor = match_state, public)]
-pub struct MatchState {
+// Match — one row per match. Replaces the old singleton MatchState.
+#[table(
+    accessor = match_state,
+    public,
+    index(accessor = match_by_status, btree(columns = [status]))
+)]
+pub struct Match {
     #[primary_key]
-    pub id: u32,
+    #[auto_inc]
+    pub id: u64,
     pub status: MatchStatus,
     pub current_round: u32,
     pub current_auction_id: Option<u64>,
     pub bag_total: u32,
     pub auction_type: AuctionType,
+    pub created_at: Timestamp,
     pub started_at: Option<Timestamp>,
     pub ended_at: Option<Timestamp>,
 }
 
-// Private — bots & spectators see only the total via the `bag_remaining` view.
-#[table(accessor = bag_letter)]
+// Per-match balance and score for one bot in one match.
+#[table(
+    accessor = match_participant,
+    public,
+    index(accessor = mp_by_match, btree(columns = [match_id])),
+    index(accessor = mp_by_bot, btree(columns = [bot]))
+)]
+pub struct MatchParticipant {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    pub match_id: u64,
+    pub bot: Identity,
+    pub balance: i64,
+    pub score: i64,
+}
+
+// Private — each match has its own bag.
+#[table(
+    accessor = bag_letter,
+    index(accessor = bag_by_match, btree(columns = [match_id]))
+)]
 pub struct BagLetter {
     #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    pub match_id: u64,
     pub letter: String,
     pub remaining: u32,
 }
 
-// Private — each bot sees only its own rack via the `my_rack` view.
+// Private — each bot sees only their own rack via `my_rack`.
 #[table(
     accessor = holding,
-    index(accessor = holding_by_bot, btree(columns = [bot]))
+    index(accessor = holding_by_bot, btree(columns = [bot])),
+    index(accessor = holding_by_match, btree(columns = [match_id]))
 )]
 pub struct Holding {
     #[primary_key]
     #[auto_inc]
     pub id: u64,
+    pub match_id: u64,
     pub bot: Identity,
     pub letter: String,
     pub count: u32,
@@ -94,19 +128,21 @@ pub struct Holding {
 #[table(
     accessor = auction,
     public,
+    index(accessor = auction_by_match, btree(columns = [match_id])),
     index(accessor = auction_by_status, btree(columns = [status]))
 )]
 pub struct Auction {
     #[primary_key]
     #[auto_inc]
     pub id: u64,
+    pub match_id: u64,
     pub letter: String,
     pub opens_at: Timestamp,
     pub closes_at: Timestamp,
     pub status: AuctionStatus,
 }
 
-// Private table — bots cannot subscribe and so cannot see competing bids.
+// Private — bots cannot subscribe and so cannot see competing bids.
 #[table(
     accessor = pending_bid,
     index(accessor = bid_by_auction, btree(columns = [auction_id]))
@@ -121,26 +157,33 @@ pub struct PendingBid {
     pub submitted_at: Timestamp,
 }
 
-#[table(accessor = auction_result, public)]
+#[table(
+    accessor = auction_result,
+    public,
+    index(accessor = result_by_match, btree(columns = [match_id]))
+)]
 pub struct AuctionResult {
     #[primary_key]
     pub auction_id: u64,
+    pub match_id: u64,
     pub letter: String,
     pub winner: Option<Identity>,
-    pub top_bid: i64,    // winner's actual bid (highest)
-    pub paid: i64,       // what they paid (second-highest, or reserve for sole bidder)
+    pub top_bid: i64,
+    pub paid: i64,
     pub closed_at: Timestamp,
 }
 
 #[table(
     accessor = word_play,
     public,
+    index(accessor = play_by_match, btree(columns = [match_id])),
     index(accessor = play_by_bot, btree(columns = [bot]))
 )]
 pub struct WordPlay {
     #[primary_key]
     #[auto_inc]
     pub id: u64,
+    pub match_id: u64,
     pub bot: Identity,
     pub word: String,
     pub base_score: i64,
@@ -155,41 +198,27 @@ pub struct AuctionSchedule {
     #[auto_inc]
     pub scheduled_id: u64,
     pub scheduled_at: ScheduleAt,
+    pub match_id: u64,
 }
 
 // ---------- Views ----------
-// Each bot sees only its own letters; the per-letter bag composition stays
-// hidden. Total tiles remaining is already public via MatchState.bag_total.
+
+// A bot sees only its own letters (across any matches it's in). Clients
+// filter by match_id on their side.
 #[view(accessor = my_rack, public)]
 fn my_rack(ctx: &ViewContext) -> Vec<Holding> {
     ctx.db
         .holding()
         .holding_by_bot()
-        .filter(&ctx.sender())
+        .filter(ctx.sender())
         .collect()
 }
 
 // ---------- Lifecycle ----------
 
 #[reducer(init)]
-pub fn init(ctx: &ReducerContext) {
-    let total: u32 = letters::DEFAULT_BAG.iter().map(|(_, c)| c).sum();
-    ctx.db.match_state().insert(MatchState {
-        id: SINGLETON_MATCH_ID,
-        status: MatchStatus::Lobby,
-        current_round: 0,
-        current_auction_id: None,
-        bag_total: total,
-        auction_type: AuctionType::Vickrey,
-        started_at: None,
-        ended_at: None,
-    });
-    for (letter, count) in letters::DEFAULT_BAG.iter() {
-        ctx.db.bag_letter().insert(BagLetter {
-            letter: letter.to_string(),
-            remaining: *count,
-        });
-    }
+pub fn init(_ctx: &ReducerContext) {
+    // Nothing global to bootstrap — matches and bags are per-match now.
 }
 
 #[reducer(client_connected)]
@@ -229,8 +258,6 @@ pub fn register_bot(ctx: &ReducerContext, name: String) -> Result<(), String> {
     ctx.db.bot().insert(Bot {
         identity: ctx.sender(),
         name: trimmed.to_string(),
-        balance: STARTING_BALANCE,
-        score: 0,
         connected: true,
         registered_at: ctx.timestamp,
         is_simulated: false,
@@ -256,7 +283,6 @@ pub fn spawn_simulated_bot(
     if ctx.db.bot().name().find(trimmed.to_string()).is_some() {
         return Err("Name already taken".into());
     }
-    // Deterministic fabricated identity so simulated bots persist across calls.
     let identity = Identity::from_claims("sim", trimmed);
     if ctx.db.bot().identity().find(identity).is_some() {
         return Err("Simulated bot already exists".into());
@@ -264,8 +290,6 @@ pub fn spawn_simulated_bot(
     ctx.db.bot().insert(Bot {
         identity,
         name: trimmed.to_string(),
-        balance: STARTING_BALANCE,
-        score: 0,
         connected: true,
         registered_at: ctx.timestamp,
         is_simulated: true,
@@ -277,146 +301,98 @@ pub fn spawn_simulated_bot(
 
 // ---------- Match control ----------
 
+// Start a match with every currently-registered bot.
 #[reducer]
-pub fn set_auction_type(ctx: &ReducerContext, auction_type: AuctionType) -> Result<(), String> {
-    let m = ctx
-        .db
-        .match_state()
-        .id()
-        .find(SINGLETON_MATCH_ID)
-        .ok_or("No match")?;
-    if m.status != MatchStatus::Lobby {
-        return Err("Can only change auction type before the match starts".into());
-    }
-    ctx.db.match_state().id().update(MatchState {
-        auction_type,
-        ..m
-    });
-    Ok(())
+pub fn start_match(ctx: &ReducerContext, auction_type: AuctionType) -> Result<(), String> {
+    let participants: Vec<Identity> = ctx.db.bot().iter().map(|b| b.identity).collect();
+    start_match_with(ctx, auction_type, participants)
 }
 
+// Start a match with a specific roster.
 #[reducer]
-pub fn reset_match(ctx: &ReducerContext) -> Result<(), String> {
-    // Clear all per-match tables.
-    let auction_ids: Vec<u64> = ctx.db.auction().iter().map(|a| a.id).collect();
-    for id in auction_ids {
-        ctx.db.auction().id().delete(id);
+pub fn start_match_for(
+    ctx: &ReducerContext,
+    auction_type: AuctionType,
+    participants: Vec<Identity>,
+) -> Result<(), String> {
+    start_match_with(ctx, auction_type, participants)
+}
+
+fn start_match_with(
+    ctx: &ReducerContext,
+    auction_type: AuctionType,
+    participants: Vec<Identity>,
+) -> Result<(), String> {
+    if participants.is_empty() {
+        return Err("Need at least one participant".into());
     }
-    let result_ids: Vec<u64> = ctx
-        .db
-        .auction_result()
-        .iter()
-        .map(|r| r.auction_id)
-        .collect();
-    for id in result_ids {
-        ctx.db.auction_result().auction_id().delete(id);
+    let bag_total: u32 = letters::DEFAULT_BAG.iter().map(|(_, c)| c).sum();
+    let m = ctx.db.match_state().insert(Match {
+        id: 0,
+        status: MatchStatus::Running,
+        current_round: 1,
+        current_auction_id: None,
+        bag_total,
+        auction_type,
+        created_at: ctx.timestamp,
+        started_at: Some(ctx.timestamp),
+        ended_at: None,
+    });
+    let match_id = m.id;
+
+    for identity in &participants {
+        if ctx.db.bot().identity().find(*identity).is_none() {
+            return Err(format!("Unknown bot in roster: {}", identity.to_hex()));
+        }
+        ctx.db.match_participant().insert(MatchParticipant {
+            id: 0,
+            match_id,
+            bot: *identity,
+            balance: STARTING_BALANCE,
+            score: 0,
+        });
     }
-    let bid_ids: Vec<u64> = ctx.db.pending_bid().iter().map(|b| b.id).collect();
-    for id in bid_ids {
-        ctx.db.pending_bid().id().delete(id);
-    }
-    let holding_ids: Vec<u64> = ctx.db.holding().iter().map(|h| h.id).collect();
-    for id in holding_ids {
-        ctx.db.holding().id().delete(id);
-    }
-    let play_ids: Vec<u64> = ctx.db.word_play().iter().map(|p| p.id).collect();
-    for id in play_ids {
-        ctx.db.word_play().id().delete(id);
-    }
-    let schedule_ids: Vec<u64> = ctx
-        .db
-        .auction_schedule()
-        .iter()
-        .map(|s| s.scheduled_id)
-        .collect();
-    for id in schedule_ids {
-        ctx.db.auction_schedule().scheduled_id().delete(id);
-    }
-    // Refill the bag from scratch.
-    let existing_letters: Vec<String> = ctx.db.bag_letter().iter().map(|b| b.letter).collect();
-    for l in existing_letters {
-        ctx.db.bag_letter().letter().delete(&l);
-    }
-    let total: u32 = letters::DEFAULT_BAG.iter().map(|(_, c)| c).sum();
+
     for (letter, count) in letters::DEFAULT_BAG.iter() {
         ctx.db.bag_letter().insert(BagLetter {
+            id: 0,
+            match_id,
             letter: letter.to_string(),
             remaining: *count,
         });
     }
-    // Reset every bot's balance and score, but keep registrations.
-    let bots: Vec<Bot> = ctx.db.bot().iter().collect();
-    for bot in bots {
-        ctx.db.bot().identity().update(Bot {
-            balance: STARTING_BALANCE,
-            score: 0,
-            ..bot
-        });
-    }
-    // Reset the match singleton, preserving the chosen auction type.
-    let m = ctx
-        .db
-        .match_state()
-        .id()
-        .find(SINGLETON_MATCH_ID)
-        .ok_or("No match")?;
-    ctx.db.match_state().id().update(MatchState {
-        status: MatchStatus::Lobby,
-        current_round: 0,
-        current_auction_id: None,
-        bag_total: total,
-        started_at: None,
-        ended_at: None,
-        ..m
-    });
-    log::info!("Match reset");
-    Ok(())
-}
 
-#[reducer]
-pub fn start_match(ctx: &ReducerContext) -> Result<(), String> {
-    let m = ctx
-        .db
-        .match_state()
-        .id()
-        .find(SINGLETON_MATCH_ID)
-        .ok_or("No match initialized")?;
-    if m.status != MatchStatus::Lobby {
-        return Err("Match already started or ended".into());
-    }
-    if ctx.db.bot().iter().count() < 1 {
-        return Err("At least one bot must register before starting".into());
-    }
-
-    let letter = draw_letter(ctx).ok_or("Bag empty")?;
+    let first_letter = draw_letter(ctx, match_id).ok_or("Bag empty")?;
     let opens_at = ctx.timestamp;
     let closes_at = ctx.timestamp + Duration::from_millis(AUCTION_DURATION_MS);
     let auction = ctx.db.auction().insert(Auction {
         id: 0,
-        letter,
+        match_id,
+        letter: first_letter,
         opens_at,
         closes_at,
         status: AuctionStatus::Open,
     });
 
-    let m = ctx.db.match_state().id().find(SINGLETON_MATCH_ID).unwrap();
-    ctx.db.match_state().id().update(MatchState {
-        status: MatchStatus::Running,
-        current_round: 1,
+    let m = ctx.db.match_state().id().find(match_id).unwrap();
+    ctx.db.match_state().id().update(Match {
         current_auction_id: Some(auction.id),
-        started_at: Some(ctx.timestamp),
         ..m
     });
 
     ctx.db.auction_schedule().insert(AuctionSchedule {
         scheduled_id: 0,
         scheduled_at: ScheduleAt::Time(closes_at),
+        match_id,
     });
 
-    // Sim bots bid on the opening auction too.
     simulate_bids(ctx, &auction);
 
-    log::info!("Match started; first auction id={}", auction.id);
+    log::info!(
+        "Match {} started with {} participants",
+        match_id,
+        participants.len()
+    );
     Ok(())
 }
 
@@ -426,15 +402,6 @@ pub fn start_match(ctx: &ReducerContext) -> Result<(), String> {
 pub fn submit_bid(ctx: &ReducerContext, auction_id: u64, amount: i64) -> Result<(), String> {
     if amount < 0 {
         return Err("Bid must be non-negative".into());
-    }
-    let bot = ctx
-        .db
-        .bot()
-        .identity()
-        .find(ctx.sender())
-        .ok_or("Not registered")?;
-    if bot.balance < amount {
-        return Err("Insufficient balance".into());
     }
     let auction = ctx
         .db
@@ -448,13 +415,17 @@ pub fn submit_bid(ctx: &ReducerContext, auction_id: u64, amount: i64) -> Result<
     if ctx.timestamp >= auction.closes_at {
         return Err("Auction window expired".into());
     }
+    let participant =
+        find_participant(ctx, auction.match_id, ctx.sender()).ok_or("Not in this match")?;
+    if participant.balance < amount {
+        return Err("Insufficient balance".into());
+    }
 
-    // Replace any earlier bid by this bot on this auction (last-write-wins).
     let existing: Vec<u64> = ctx
         .db
         .pending_bid()
         .bid_by_auction()
-        .filter(&auction_id)
+        .filter(auction_id)
         .filter(|b| b.bidder == ctx.sender())
         .map(|b| b.id)
         .collect();
@@ -475,22 +446,18 @@ pub fn submit_bid(ctx: &ReducerContext, auction_id: u64, amount: i64) -> Result<
 // ---------- Word play ----------
 
 #[reducer]
-pub fn submit_word(ctx: &ReducerContext, word: String) -> Result<(), String> {
-    let bot = ctx
-        .db
-        .bot()
-        .identity()
-        .find(ctx.sender())
-        .ok_or("Not registered")?;
+pub fn submit_word(ctx: &ReducerContext, match_id: u64, word: String) -> Result<(), String> {
     let m = ctx
         .db
         .match_state()
         .id()
-        .find(SINGLETON_MATCH_ID)
-        .ok_or("No match")?;
+        .find(match_id)
+        .ok_or("Unknown match")?;
     if m.status != MatchStatus::Running {
         return Err("Match not running".into());
     }
+    let participant =
+        find_participant(ctx, match_id, ctx.sender()).ok_or("Not in this match")?;
 
     let word_upper = word.to_ascii_uppercase();
     if word_upper.len() < 2 {
@@ -503,18 +470,187 @@ pub fn submit_word(ctx: &ReducerContext, word: String) -> Result<(), String> {
         return Err(format!("'{}' is not in the dictionary", word_upper));
     }
 
-    // Tally needed letters.
+    play_word(ctx, participant, &word_upper)
+}
+
+// ---------- Auction tick (scheduled) ----------
+
+#[reducer]
+pub fn auction_tick(ctx: &ReducerContext, job: AuctionSchedule) {
+    let match_id = job.match_id;
+    let m = match ctx.db.match_state().id().find(match_id) {
+        Some(m) if m.status == MatchStatus::Running => m,
+        _ => return,
+    };
+    let Some(auction_id) = m.current_auction_id else {
+        return;
+    };
+    let Some(auction) = ctx.db.auction().id().find(auction_id) else {
+        return;
+    };
+
+    let bids: Vec<PendingBid> = ctx
+        .db
+        .pending_bid()
+        .bid_by_auction()
+        .filter(auction_id)
+        .collect();
+    let mut sorted: Vec<&PendingBid> = bids.iter().filter(|b| b.amount > 0).collect();
+    sorted.sort_by(|a, b| b.amount.cmp(&a.amount).then(a.id.cmp(&b.id)));
+
+    let (winner, top_bid, paid) = match (m.auction_type.clone(), sorted.as_slice()) {
+        (_, []) => (None, 0, 0),
+        (AuctionType::FirstPrice, [only]) => (Some(only.bidder), only.amount, only.amount),
+        (AuctionType::FirstPrice, [first, ..]) => (Some(first.bidder), first.amount, first.amount),
+        (AuctionType::Vickrey, [only]) => {
+            (Some(only.bidder), only.amount, AUCTION_RESERVE.min(only.amount))
+        }
+        (AuctionType::Vickrey, [first, second, ..]) => {
+            (Some(first.bidder), first.amount, second.amount)
+        }
+    };
+
+    let mut sim_winner: Option<Identity> = None;
+    if let Some(w) = winner {
+        if let Some(participant) = find_participant(ctx, match_id, w) {
+            if participant.balance >= paid {
+                let bot_is_sim = ctx
+                    .db
+                    .bot()
+                    .identity()
+                    .find(w)
+                    .map(|b| b.is_simulated)
+                    .unwrap_or(false);
+                let new_balance = participant.balance - paid;
+                ctx.db.match_participant().id().update(MatchParticipant {
+                    balance: new_balance,
+                    ..participant
+                });
+                let existing: Vec<Holding> = ctx
+                    .db
+                    .holding()
+                    .holding_by_bot()
+                    .filter(w)
+                    .filter(|h| h.match_id == match_id && h.letter == auction.letter)
+                    .collect();
+                if let Some(h) = existing.into_iter().next() {
+                    ctx.db.holding().id().update(Holding {
+                        count: h.count + 1,
+                        ..h
+                    });
+                } else {
+                    ctx.db.holding().insert(Holding {
+                        id: 0,
+                        match_id,
+                        bot: w,
+                        letter: auction.letter.clone(),
+                        count: 1,
+                    });
+                }
+                if bot_is_sim {
+                    sim_winner = Some(w);
+                }
+            }
+        }
+    } else {
+        return_to_bag(ctx, match_id, &auction.letter);
+    }
+
+    ctx.db.auction_result().insert(AuctionResult {
+        auction_id,
+        match_id,
+        letter: auction.letter.clone(),
+        winner,
+        top_bid,
+        paid,
+        closed_at: ctx.timestamp,
+    });
+    ctx.db.auction().id().update(Auction {
+        status: AuctionStatus::Closed,
+        ..auction
+    });
+    for b in bids {
+        ctx.db.pending_bid().id().delete(b.id);
+    }
+
+    if let Some(w) = sim_winner {
+        simulate_word_play(ctx, match_id, w);
+    }
+
+    let m2 = ctx.db.match_state().id().find(match_id).unwrap();
+    let next_letter = match draw_letter(ctx, match_id) {
+        Some(l) => l,
+        None => {
+            ctx.db.match_state().id().update(Match {
+                status: MatchStatus::Ended,
+                current_auction_id: None,
+                ended_at: Some(ctx.timestamp),
+                ..m2
+            });
+            log::info!("Match {} ended (bag empty)", match_id);
+            return;
+        }
+    };
+
+    let opens_at = ctx.timestamp;
+    let closes_at = ctx.timestamp + Duration::from_millis(AUCTION_DURATION_MS);
+    let next_auction = ctx.db.auction().insert(Auction {
+        id: 0,
+        match_id,
+        letter: next_letter,
+        opens_at,
+        closes_at,
+        status: AuctionStatus::Open,
+    });
+
+    let m3 = ctx.db.match_state().id().find(match_id).unwrap();
+    ctx.db.match_state().id().update(Match {
+        current_round: m3.current_round + 1,
+        current_auction_id: Some(next_auction.id),
+        ..m3
+    });
+    ctx.db.auction_schedule().insert(AuctionSchedule {
+        scheduled_id: 0,
+        scheduled_at: ScheduleAt::Time(closes_at),
+        match_id,
+    });
+
+    simulate_bids(ctx, &next_auction);
+}
+
+// ---------- Helpers ----------
+
+fn find_participant(
+    ctx: &ReducerContext,
+    match_id: u64,
+    bot: Identity,
+) -> Option<MatchParticipant> {
+    ctx.db
+        .match_participant()
+        .mp_by_match()
+        .filter(match_id)
+        .find(|p| p.bot == bot)
+}
+
+fn play_word(
+    ctx: &ReducerContext,
+    participant: MatchParticipant,
+    word_upper: &str,
+) -> Result<(), String> {
+    let match_id = participant.match_id;
+    let bot_identity = participant.bot;
+
     let mut needed: std::collections::HashMap<char, u32> = std::collections::HashMap::new();
     for c in word_upper.chars() {
         *needed.entry(c).or_insert(0) += 1;
     }
 
-    // Index this bot's holdings by letter.
     let holdings: Vec<Holding> = ctx
         .db
         .holding()
         .holding_by_bot()
-        .filter(&ctx.sender())
+        .filter(bot_identity)
+        .filter(|h| h.match_id == match_id)
         .collect();
     let mut by_letter: std::collections::HashMap<char, (u64, u32)> =
         std::collections::HashMap::new();
@@ -530,7 +666,6 @@ pub fn submit_word(ctx: &ReducerContext, word: String) -> Result<(), String> {
         }
     }
 
-    // Deduct letters.
     for (c, n) in &needed {
         let (hid, ct) = by_letter[c];
         let new_ct = ct - n;
@@ -544,7 +679,6 @@ pub fn submit_word(ctx: &ReducerContext, word: String) -> Result<(), String> {
         }
     }
 
-    // Score.
     let base_score: i64 = word_upper
         .chars()
         .map(|c| letters::letter_value(c) as i64)
@@ -553,16 +687,19 @@ pub fn submit_word(ctx: &ReducerContext, word: String) -> Result<(), String> {
     let total_reward = base_score * num / denom;
     let bonus = total_reward - base_score;
 
-    ctx.db.bot().identity().update(Bot {
-        balance: bot.balance + total_reward,
-        score: bot.score + total_reward,
-        ..bot
+    let new_balance = participant.balance + total_reward;
+    let new_score = participant.score + total_reward;
+    ctx.db.match_participant().id().update(MatchParticipant {
+        balance: new_balance,
+        score: new_score,
+        ..participant
     });
 
     ctx.db.word_play().insert(WordPlay {
         id: 0,
-        bot: ctx.sender(),
-        word: word_upper.clone(),
+        match_id,
+        bot: bot_identity,
+        word: word_upper.to_string(),
         base_score,
         bonus,
         total_reward,
@@ -570,7 +707,8 @@ pub fn submit_word(ctx: &ReducerContext, word: String) -> Result<(), String> {
     });
 
     log::info!(
-        "Word '{}' played: base={}, bonus={}, total={}",
+        "[match {}] '{}' played: base={}, bonus={}, total={}",
+        match_id,
         word_upper,
         base_score,
         bonus,
@@ -579,164 +717,17 @@ pub fn submit_word(ctx: &ReducerContext, word: String) -> Result<(), String> {
     Ok(())
 }
 
-// ---------- Auction tick (scheduled) ----------
-
-#[reducer]
-pub fn auction_tick(ctx: &ReducerContext, _job: AuctionSchedule) {
-    let m = match ctx.db.match_state().id().find(SINGLETON_MATCH_ID) {
-        Some(m) if m.status == MatchStatus::Running => m,
-        _ => return,
-    };
-    let Some(auction_id) = m.current_auction_id else {
-        return;
-    };
-    let Some(auction) = ctx.db.auction().id().find(auction_id) else {
-        return;
-    };
-
-    // Resolve highest bid; ties broken by earlier submission (lower id).
-    let bids: Vec<PendingBid> = ctx
-        .db
-        .pending_bid()
-        .bid_by_auction()
-        .filter(&auction_id)
-        .collect();
-    // Sort bids descending by amount; ties broken by earlier submission.
-    let mut sorted: Vec<&PendingBid> = bids.iter().filter(|b| b.amount > 0).collect();
-    sorted.sort_by(|a, b| b.amount.cmp(&a.amount).then(a.id.cmp(&b.id)));
-
-    // Auction type determines what the winner pays. FirstPrice: pays own bid.
-    // Vickrey: pays runner-up's bid (or AUCTION_RESERVE if they're the only
-    // bidder).
-    let (winner, top_bid, paid) = match (m.auction_type.clone(), sorted.as_slice()) {
-        (_, []) => (None, 0, 0),
-        (AuctionType::FirstPrice, [only]) => (Some(only.bidder), only.amount, only.amount),
-        (AuctionType::FirstPrice, [first, ..]) => {
-            (Some(first.bidder), first.amount, first.amount)
-        }
-        (AuctionType::Vickrey, [only]) => {
-            (Some(only.bidder), only.amount, AUCTION_RESERVE.min(only.amount))
-        }
-        (AuctionType::Vickrey, [first, second, ..]) => {
-            (Some(first.bidder), first.amount, second.amount)
-        }
-    };
-
-    let mut sim_winner: Option<Identity> = None;
-    if let Some(w) = winner {
-        if let Some(bot) = ctx.db.bot().identity().find(w) {
-            if bot.balance >= paid {
-                let is_sim = bot.is_simulated;
-                ctx.db.bot().identity().update(Bot {
-                    balance: bot.balance - paid,
-                    ..bot
-                });
-                // Add letter to winner's rack.
-                let existing: Vec<Holding> = ctx
-                    .db
-                    .holding()
-                    .holding_by_bot()
-                    .filter(&w)
-                    .filter(|h| h.letter == auction.letter)
-                    .collect();
-                if let Some(h) = existing.into_iter().next() {
-                    ctx.db.holding().id().update(Holding {
-                        count: h.count + 1,
-                        ..h
-                    });
-                } else {
-                    ctx.db.holding().insert(Holding {
-                        id: 0,
-                        bot: w,
-                        letter: auction.letter.clone(),
-                        count: 1,
-                    });
-                }
-                if is_sim {
-                    sim_winner = Some(w);
-                }
-            }
-        }
-    } else {
-        // No winning bid — return the tile to the bag.
-        return_to_bag(ctx, &auction.letter);
-    }
-
-    ctx.db.auction_result().insert(AuctionResult {
-        auction_id,
-        letter: auction.letter.clone(),
-        winner,
-        top_bid,
-        paid,
-        closed_at: ctx.timestamp,
-    });
-    ctx.db.auction().id().update(Auction {
-        status: AuctionStatus::Closed,
-        ..auction
-    });
-    for b in bids {
-        ctx.db.pending_bid().id().delete(b.id);
-    }
-
-    // Now that the winner has the tile, let simulated winners try a word.
-    if let Some(w) = sim_winner {
-        simulate_word_play(ctx, w);
-    }
-
-    // Open next auction or end the match.
-    let m2 = ctx.db.match_state().id().find(SINGLETON_MATCH_ID).unwrap();
-    let next_letter = match draw_letter(ctx) {
-        Some(l) => l,
-        None => {
-            ctx.db.match_state().id().update(MatchState {
-                status: MatchStatus::Ended,
-                current_auction_id: None,
-                ended_at: Some(ctx.timestamp),
-                ..m2
-            });
-            log::info!("Match ended (bag empty)");
-            return;
-        }
-    };
-
-    let opens_at = ctx.timestamp;
-    let closes_at = ctx.timestamp + Duration::from_millis(AUCTION_DURATION_MS);
-    let next_auction = ctx.db.auction().insert(Auction {
-        id: 0,
-        letter: next_letter,
-        opens_at,
-        closes_at,
-        status: AuctionStatus::Open,
-    });
-
-    let m3 = ctx.db.match_state().id().find(SINGLETON_MATCH_ID).unwrap();
-    ctx.db.match_state().id().update(MatchState {
-        current_round: m3.current_round + 1,
-        current_auction_id: Some(next_auction.id),
-        ..m3
-    });
-    ctx.db.auction_schedule().insert(AuctionSchedule {
-        scheduled_id: 0,
-        scheduled_at: ScheduleAt::Time(closes_at),
-    });
-
-    // Let every simulated bot bid on the newly opened auction.
-    simulate_bids(ctx, &next_auction);
-}
-
-// ---------- Helpers ----------
-
-fn draw_letter(ctx: &ReducerContext) -> Option<String> {
-    let m = ctx.db.match_state().id().find(SINGLETON_MATCH_ID)?;
+fn draw_letter(ctx: &ReducerContext, match_id: u64) -> Option<String> {
+    let m = ctx.db.match_state().id().find(match_id)?;
     if m.bag_total == 0 {
         return None;
     }
     let mut idx: u32 = ctx.rng().gen_range(0..m.bag_total);
-    // Iterate bag entries deterministically (sort by letter).
     let mut entries: Vec<BagLetter> = ctx
         .db
         .bag_letter()
-        .iter()
+        .bag_by_match()
+        .filter(match_id)
         .filter(|b| b.remaining > 0)
         .collect();
     entries.sort_by(|a, b| a.letter.cmp(&b.letter));
@@ -744,11 +735,15 @@ fn draw_letter(ctx: &ReducerContext) -> Option<String> {
         if idx < bag.remaining {
             let letter = bag.letter.clone();
             let new_remaining = bag.remaining - 1;
-            ctx.db.bag_letter().letter().update(BagLetter {
-                remaining: new_remaining,
+            let bag_id = bag.id;
+            let bag_match_id = bag.match_id;
+            ctx.db.bag_letter().id().update(BagLetter {
+                id: bag_id,
+                match_id: bag_match_id,
                 letter: letter.clone(),
+                remaining: new_remaining,
             });
-            ctx.db.match_state().id().update(MatchState {
+            ctx.db.match_state().id().update(Match {
                 bag_total: m.bag_total - 1,
                 ..m
             });
@@ -759,20 +754,28 @@ fn draw_letter(ctx: &ReducerContext) -> Option<String> {
     None
 }
 
-fn return_to_bag(ctx: &ReducerContext, letter: &str) {
-    if let Some(bag) = ctx.db.bag_letter().letter().find(letter.to_string()) {
-        ctx.db.bag_letter().letter().update(BagLetter {
+fn return_to_bag(ctx: &ReducerContext, match_id: u64, letter: &str) {
+    let entry = ctx
+        .db
+        .bag_letter()
+        .bag_by_match()
+        .filter(match_id)
+        .find(|b| b.letter == letter);
+    if let Some(bag) = entry {
+        ctx.db.bag_letter().id().update(BagLetter {
             remaining: bag.remaining + 1,
-            letter: bag.letter.clone(),
+            ..bag
         });
     } else {
         ctx.db.bag_letter().insert(BagLetter {
+            id: 0,
+            match_id,
             letter: letter.to_string(),
             remaining: 1,
         });
     }
-    if let Some(m) = ctx.db.match_state().id().find(SINGLETON_MATCH_ID) {
-        ctx.db.match_state().id().update(MatchState {
+    if let Some(m) = ctx.db.match_state().id().find(match_id) {
+        ctx.db.match_state().id().update(Match {
             bag_total: m.bag_total + 1,
             ..m
         });
@@ -781,39 +784,42 @@ fn return_to_bag(ctx: &ReducerContext, letter: &str) {
 
 // ---------- Simulated-bot logic ----------
 
-// Each sim strategy is meant to *value* a letter differently. Under a Vickrey
-// auction the dominant strategy is to bid your true valuation, so the bots
-// just bid the value they personally assign to the tile.
 fn decide_bid(strategy: &BotStrategy, letter: &str, balance: i64) -> i64 {
     let c = letter.chars().next().unwrap_or('A');
     let value = letters::letter_value(c) as i64;
     let is_vowel = matches!(c, 'A' | 'E' | 'I' | 'O' | 'U');
     let bid = match strategy {
         BotStrategy::Human => return 0,
-        // Cheapskate undervalues — face value minus 1, floor 1.
         BotStrategy::Cheapskate => (value - 1).max(1),
-        // ValueBidder bids exactly face value.
         BotStrategy::ValueBidder => value,
-        // Aggressive bids face value + premium, with extra for vowels because
-        // they enable more words.
         BotStrategy::Aggressive => value + if is_vowel { 4 } else { 2 },
     };
     bid.min(balance).max(0)
 }
 
 fn simulate_bids(ctx: &ReducerContext, auction: &Auction) {
-    let sims: Vec<Bot> = ctx.db.bot().iter().filter(|b| b.is_simulated).collect();
-    for bot in sims {
-        let amount = decide_bid(&bot.strategy, &auction.letter, bot.balance);
+    let participants: Vec<MatchParticipant> = ctx
+        .db
+        .match_participant()
+        .mp_by_match()
+        .filter(auction.match_id)
+        .collect();
+    for p in participants {
+        let Some(bot) = ctx.db.bot().identity().find(p.bot) else {
+            continue;
+        };
+        if !bot.is_simulated {
+            continue;
+        }
+        let amount = decide_bid(&bot.strategy, &auction.letter, p.balance);
         if amount <= 0 {
             continue;
         }
-        // Clear any prior bid by this sim bot on this auction.
         let prior: Vec<u64> = ctx
             .db
             .pending_bid()
             .bid_by_auction()
-            .filter(&auction.id)
+            .filter(auction.id)
             .filter(|b| b.bidder == bot.identity)
             .map(|b| b.id)
             .collect();
@@ -830,15 +836,16 @@ fn simulate_bids(ctx: &ReducerContext, auction: &Auction) {
     }
 }
 
-fn simulate_word_play(ctx: &ReducerContext, bot_identity: Identity) {
-    let Some(bot) = ctx.db.bot().identity().find(bot_identity) else {
+fn simulate_word_play(ctx: &ReducerContext, match_id: u64, bot_identity: Identity) {
+    let Some(participant) = find_participant(ctx, match_id, bot_identity) else {
         return;
     };
     let holdings: Vec<Holding> = ctx
         .db
         .holding()
         .holding_by_bot()
-        .filter(&bot_identity)
+        .filter(bot_identity)
+        .filter(|h| h.match_id == match_id)
         .collect();
     let mut rack: std::collections::HashMap<char, u32> = std::collections::HashMap::new();
     for h in &holdings {
@@ -846,54 +853,8 @@ fn simulate_word_play(ctx: &ReducerContext, bot_identity: Identity) {
             *rack.entry(c).or_insert(0) += h.count;
         }
     }
-    // Require at least a 3-letter word, since 2-letter words pay 1x with little upside.
     let Some(word) = dictionary::find_best_playable(&rack, 3) else {
         return;
     };
-
-    // Deduct letters.
-    let mut needed: std::collections::HashMap<char, u32> = std::collections::HashMap::new();
-    for c in word.chars() {
-        *needed.entry(c).or_insert(0) += 1;
-    }
-    let mut by_letter: std::collections::HashMap<char, (u64, u32)> =
-        std::collections::HashMap::new();
-    for h in &holdings {
-        if let Some(c) = h.letter.chars().next() {
-            by_letter.insert(c, (h.id, h.count));
-        }
-    }
-    for (c, n) in &needed {
-        let (hid, ct) = by_letter[c];
-        let new_ct = ct - n;
-        if new_ct == 0 {
-            ctx.db.holding().id().delete(hid);
-        } else if let Some(h) = ctx.db.holding().id().find(hid) {
-            ctx.db.holding().id().update(Holding {
-                count: new_ct,
-                ..h
-            });
-        }
-    }
-
-    let base_score: i64 = word.chars().map(|c| letters::letter_value(c) as i64).sum();
-    let (num, denom) = letters::length_multiplier(word.len());
-    let total_reward = base_score * num / denom;
-    let bonus = total_reward - base_score;
-
-    ctx.db.bot().identity().update(Bot {
-        balance: bot.balance + total_reward,
-        score: bot.score + total_reward,
-        ..bot
-    });
-    ctx.db.word_play().insert(WordPlay {
-        id: 0,
-        bot: bot_identity,
-        word: word.clone(),
-        base_score,
-        bonus,
-        total_reward,
-        played_at: ctx.timestamp,
-    });
-    log::info!("[sim] played '{}' for {}", word, total_reward);
+    let _ = play_word(ctx, participant, &word);
 }

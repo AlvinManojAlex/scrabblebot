@@ -5,7 +5,8 @@ import type {
   Auction,
   AuctionResult,
   Bot,
-  MatchState,
+  Match,
+  MatchParticipant,
   WordPlay,
 } from "./module_bindings/types";
 
@@ -13,8 +14,10 @@ const HOST = import.meta.env.VITE_STDB_HOST ?? "https://maincloud.spacetimedb.co
 const DB_NAME = import.meta.env.VITE_STDB_DB ?? "wordsmith-gf28z";
 
 interface Snapshot {
-  match: MatchState | null;
+  match: Match | null;
   bots: Bot[];
+  // Per-match leaderboard rows (only for the focused match)
+  participants: MatchParticipant[];
   auction: Auction | null;
   results: AuctionResult[];
   // Reconstructed from public events: identity hex -> letter -> count
@@ -23,29 +26,58 @@ interface Snapshot {
   bagRemaining: number;
 }
 
+// Pick the most-recently-created match. Running matches beat ended/lobby of
+// the same age via id ordering (auto_inc → bigger id is newer).
+function pickCurrentMatch(conn: DbConnection): Match | null {
+  let best: Match | null = null;
+  for (const m of conn.db.match_state.iter()) {
+    if (!best || m.id > best.id) best = m;
+  }
+  return best;
+}
+
 function snapshot(conn: DbConnection): Snapshot {
-  const match = conn.db.match_state.id.find(0) ?? null;
+  const match = pickCurrentMatch(conn);
+  const matchId = match?.id ?? null;
+
   const bots: Bot[] = [];
   for (const b of conn.db.bot.iter()) bots.push(b);
-  bots.sort((a, b) => Number(b.score - a.score));
+
+  const participants: MatchParticipant[] = [];
+  if (matchId !== null) {
+    for (const p of conn.db.match_participant.iter()) {
+      if (p.matchId === matchId) participants.push(p);
+    }
+  }
+  participants.sort((a, b) => Number(b.score - a.score));
 
   let auction: Auction | null = null;
-  for (const a of conn.db.auction.iter()) {
-    if (a.status.tag === "Open") {
-      auction = a;
-      break;
+  if (matchId !== null) {
+    for (const a of conn.db.auction.iter()) {
+      if (a.matchId === matchId && a.status.tag === "Open") {
+        auction = a;
+        break;
+      }
     }
   }
 
   const allResults: AuctionResult[] = [];
-  for (const r of conn.db.auction_result.iter()) allResults.push(r);
+  if (matchId !== null) {
+    for (const r of conn.db.auction_result.iter()) {
+      if (r.matchId === matchId) allResults.push(r);
+    }
+  }
   allResults.sort((a, b) => Number(a.auctionId - b.auctionId));
 
   const plays: WordPlay[] = [];
-  for (const p of conn.db.word_play.iter()) plays.push(p);
+  if (matchId !== null) {
+    for (const p of conn.db.word_play.iter()) {
+      if (p.matchId === matchId) plays.push(p);
+    }
+  }
   plays.sort((a, b) => Number(a.id - b.id));
 
-  // Reconstruct each bot's rack: tiles won minus tiles spent on words.
+  // Reconstruct each bot's rack in this match from public events.
   const racks = new Map<string, Map<string, number>>();
   for (const r of allResults) {
     if (!r.winner) continue;
@@ -66,6 +98,7 @@ function snapshot(conn: DbConnection): Snapshot {
   return {
     match,
     bots,
+    participants,
     auction,
     results: allResults.slice(-10).reverse(),
     racks,
@@ -102,7 +135,8 @@ export default function App() {
   const [conn, setConn] = useState<DbConnection | null>(null);
   const [state, setState] = useState<Snapshot | null>(null);
   const [connected, setConnected] = useState(false);
-  const [tick, setTick] = useState(0);
+  const [, setTick] = useState(0);
+  const [auctionType, setAuctionType] = useState<"Vickrey" | "FirstPrice">("Vickrey");
 
   useEffect(() => {
     const c = DbConnection.builder()
@@ -120,10 +154,11 @@ export default function App() {
         const refresh = () => setState(snapshot(conn));
         for (const t of [
           conn.db.bot,
+          conn.db.match_state,
+          conn.db.match_participant,
           conn.db.auction,
           conn.db.auction_result,
           conn.db.word_play,
-          conn.db.match_state,
         ]) {
           const anyT = t as unknown as {
             onInsert: (cb: () => void) => void;
@@ -141,7 +176,7 @@ export default function App() {
     setConn(c);
   }, []);
 
-  // Tick once a second so the countdown updates smoothly.
+  // Tick a few times a second so the countdown updates smoothly.
   useEffect(() => {
     const id = window.setInterval(() => setTick((t) => t + 1), 250);
     return () => window.clearInterval(id);
@@ -161,27 +196,25 @@ export default function App() {
   const now = Date.now();
   const closesAtMs = state.auction ? fmtTimestamp(state.auction.closesAt) : 0;
   const msLeft = Math.max(0, closesAtMs - now);
-  const matchStatus = state.match?.status.tag ?? "Lobby";
-  const auctionType = state.match?.auctionType.tag ?? "Vickrey";
+  const matchStatus = state.match?.status.tag ?? "None";
+  const liveAuctionType = state.match?.auctionType.tag ?? auctionType;
+  const showStartControls = !state.match || matchStatus === "Ended";
 
   return (
     <div className="app">
       <header>
         <h1>Wordsmith</h1>
         <span className="status">
-          {matchStatus.toLowerCase()} · {auctionType.toLowerCase()} · round{" "}
+          {state.match ? `match #${state.match.id}` : "no match"} ·{" "}
+          {matchStatus.toLowerCase()} · {liveAuctionType.toLowerCase()} · round{" "}
           {state.match?.currentRound ?? 0} · bag {state.bagRemaining} left
-          {matchStatus === "Lobby" && (
+          {showStartControls && (
             <>
               {" · "}
               <select
                 className="button"
                 value={auctionType}
-                onChange={(e) =>
-                  conn?.reducers.setAuctionType({
-                    auctionType: { tag: e.target.value } as never,
-                  })
-                }
+                onChange={(e) => setAuctionType(e.target.value as "Vickrey" | "FirstPrice")}
               >
                 <option value="Vickrey">Vickrey</option>
                 <option value="FirstPrice">First-price</option>
@@ -198,17 +231,11 @@ export default function App() {
               <button
                 className="button"
                 disabled={!conn || state.bots.length === 0}
-                onClick={() => conn?.reducers.startMatch({})}
+                onClick={() =>
+                  conn?.reducers.startMatch({ auctionType: { tag: auctionType } })
+                }
               >
-                Start match
-              </button>
-            </>
-          )}
-          {matchStatus === "Ended" && (
-            <>
-              {" · "}
-              <button className="button" onClick={() => conn?.reducers.resetMatch({})}>
-                Reset match
+                {state.match ? "Start new match" : "Start match"}
               </button>
             </>
           )}
@@ -223,7 +250,9 @@ export default function App() {
             <div className="countdown">{(msLeft / 1000).toFixed(2)}s left</div>
           </>
         ) : (
-          <div className="countdown">{matchStatus === "Ended" ? "Match ended" : "Waiting…"}</div>
+          <div className="countdown">
+            {matchStatus === "Ended" ? "Match ended" : matchStatus === "None" ? "No match yet" : "Waiting…"}
+          </div>
         )}
       </section>
 
@@ -260,13 +289,14 @@ export default function App() {
 
       <section className="panel" style={{ gridColumn: "1 / -1" }}>
         <h2>Leaderboard</h2>
-        {state.bots.map((b) => {
-          const tiles = rackTiles(state.racks, b.identity);
+        {state.participants.map((p) => {
+          const bot = state.bots.find((b) => b.identity.isEqual(p.bot));
+          const tiles = rackTiles(state.racks, p.bot);
           return (
-            <div key={b.identity.toHexString()} className="row">
+            <div key={String(p.id)} className="row">
               <div>
                 <div className="name">
-                  {b.name} {b.connected ? "" : "(offline)"}
+                  {bot?.name ?? "?"} {bot?.connected ? "" : "(offline)"}
                 </div>
                 <div className="rack">
                   {tiles.map((t, i) => (
@@ -278,14 +308,17 @@ export default function App() {
                 </div>
               </div>
               <div>
-                <div style={{ textAlign: "right" }}>{String(b.score)} pts</div>
+                <div style={{ textAlign: "right" }}>{String(p.score)} pts</div>
                 <div className="secondary" style={{ textAlign: "right" }}>
-                  {String(b.balance)} balance
+                  {String(p.balance)} balance
                 </div>
               </div>
             </div>
           );
         })}
+        {state.participants.length === 0 && (
+          <div className="secondary">No participants yet — register some bots and start a match.</div>
+        )}
       </section>
 
       <section className="panel" style={{ gridColumn: "1 / -1" }}>

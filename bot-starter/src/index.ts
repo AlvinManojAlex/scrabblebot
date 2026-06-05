@@ -51,46 +51,70 @@ const DICTIONARY: string[] = fs.existsSync(dictionaryPath)
 DICTIONARY.sort((a, b) => b.length - a.length); // longest first for greedy pick
 
 let myIdentity: Identity | null = null;
-let lastBidAuction: bigint | null = null;
-let lastWordAttempt = 0;
+const bidsByAuction = new Set<string>(); // remember which auctions we've bid on
+const lastWordAttemptByMatch = new Map<string, number>();
 const WORD_RETRY_MS = 500;
 
-function rackFor(conn: DbConnection): Map<string, number> {
-  // my_rack is a view that returns only this bot's own letters.
+// Pull this bot's rack scoped to a specific match.
+function rackForMatch(conn: DbConnection, matchId: bigint): Map<string, number> {
   const rack = new Map<string, number>();
   for (const h of conn.db.my_rack.iter()) {
+    if (h.matchId !== matchId) continue;
     rack.set(h.letter, (rack.get(h.letter) ?? 0) + h.count);
   }
   return rack;
 }
 
-function myBalance(conn: DbConnection): number {
-  if (!myIdentity) return 0;
-  const me = conn.db.bot.identity.find(myIdentity);
-  return me ? Number(me.balance) : 0;
+// Find this bot's MatchParticipant entry for a given match.
+function participantForMatch(
+  conn: DbConnection,
+  matchId: bigint,
+): { balance: number; score: number } | null {
+  if (!myIdentity) return null;
+  for (const p of conn.db.match_participant.iter()) {
+    if (p.matchId !== matchId) continue;
+    if (!p.bot.isEqual(myIdentity)) continue;
+    return { balance: Number(p.balance), score: Number(p.score) };
+  }
+  return null;
 }
 
-function tryBid(conn: DbConnection, auctionId: bigint, letter: string) {
-  if (lastBidAuction === auctionId) return;
+function tryBid(conn: DbConnection, auctionId: bigint, matchId: bigint, letter: string) {
+  const key = `${matchId}:${auctionId}`;
+  if (bidsByAuction.has(key)) return;
+  const participant = participantForMatch(conn, matchId);
+  if (!participant) return; // not in this match
   const amount = decideBid({
     letter,
-    myBalance: myBalance(conn),
-    myRack: rackFor(conn),
+    myBalance: participant.balance,
+    myRack: rackForMatch(conn, matchId),
   });
   if (amount <= 0) return;
   conn.reducers.submitBid({ auctionId, amount: BigInt(amount) });
-  lastBidAuction = auctionId;
-  console.log(`[${BOT_NAME}] bid ${amount} on '${letter}' (auction ${auctionId})`);
+  bidsByAuction.add(key);
+  console.log(`[${BOT_NAME}] bid ${amount} on '${letter}' (match ${matchId}, auction ${auctionId})`);
 }
 
+// Try a word play in every match this bot is participating in.
 function tryPlayWord(conn: DbConnection) {
+  if (!myIdentity) return;
+  const matches = new Set<bigint>();
+  for (const p of conn.db.match_participant.iter()) {
+    if (p.bot.isEqual(myIdentity)) matches.add(p.matchId);
+  }
   const now = Date.now();
-  if (now - lastWordAttempt < WORD_RETRY_MS) return;
-  lastWordAttempt = now;
-  const word = chooseWord({ myRack: rackFor(conn), dictionary: DICTIONARY });
-  if (!word) return;
-  console.log(`[${BOT_NAME}] playing '${word}'`);
-  conn.reducers.submitWord({ word });
+  for (const matchId of matches) {
+    const key = String(matchId);
+    if (now - (lastWordAttemptByMatch.get(key) ?? 0) < WORD_RETRY_MS) continue;
+    lastWordAttemptByMatch.set(key, now);
+    const word = chooseWord({
+      myRack: rackForMatch(conn, matchId),
+      dictionary: DICTIONARY,
+    });
+    if (!word) continue;
+    console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
+    conn.reducers.submitWord({ matchId, word });
+  }
 }
 
 function onConnect(conn: DbConnection, identity: Identity, token: string) {
@@ -107,15 +131,16 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
         console.log(`[${BOT_NAME}] registering as '${BOT_NAME}'`);
         conn.reducers.registerBot({ name: BOT_NAME });
       }
+      // Bid on any open auctions we're a participant in.
       for (const a of conn.db.auction.iter()) {
-        if (a.status.tag === "Open") tryBid(conn, a.id, a.letter);
+        if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
       }
       tryPlayWord(conn);
     })
     .subscribeToAllTables();
 
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
-    if (a.status.tag === "Open") tryBid(conn, a.id, a.letter);
+    if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
   });
   conn.db.my_rack.onInsert(() => tryPlayWord(conn));
   conn.db.my_rack.onUpdate(() => tryPlayWord(conn));
@@ -123,7 +148,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   conn.db.auction_result.onInsert((_ctx, r) => {
     const winner = r.winner ? r.winner.toHexString().slice(0, 8) : "no-bid";
     console.log(
-      `[${BOT_NAME}] auction ${r.auctionId} '${r.letter}' → ${winner} for ${r.winningBid}`,
+      `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → ${winner} (bid ${r.topBid}, paid ${r.paid})`,
     );
   });
 }
