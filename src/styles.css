@@ -46,6 +46,13 @@ body {
   color: var(--muted);
   font-size: 12px;
 }
+.nav .auth-state {
+  color: var(--muted);
+  font-size: 12px;
+}
+.nav .auth-state a {
+  color: var(--accent);
+}
 
 .page {
   max-width: 1200px;

@@ -57,6 +57,24 @@ pub enum TournamentPhase {
     Bracket,
 }
 
+#[derive(SpacetimeType, Clone, Debug, PartialEq)]
+pub enum TeamRole {
+    Owner,
+    Member,
+}
+
+// Returned by the my_team view — the public view of the caller's team.
+// bot_token is None for non-Owners.
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct MyTeam {
+    pub id: u64,
+    pub name: String,
+    pub bot_name: String,
+    pub bot_identity: Identity,
+    pub role: TeamRole,
+    pub bot_token: Option<String>,
+}
+
 // ---------- Tables ----------
 
 // Bot — global registration. No per-match state lives here anymore.
@@ -282,6 +300,42 @@ pub struct TournamentEntry {
     pub eliminated: bool,
 }
 
+// Private — bot_token lives here and shouldn't be subscribable. Use the
+// `my_team` view for what callers can see.
+#[table(accessor = team)]
+#[derive(Clone)]
+pub struct Team {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    #[unique]
+    pub name: String,
+    pub bot_name: String,
+    #[unique]
+    pub bot_identity: Identity,
+    pub bot_token: String,
+    pub created_at: Timestamp,
+}
+
+// Public — rosters can be displayed. One user can belong to at most one team
+// (enforced via #[unique] on `user`).
+#[table(
+    accessor = team_member,
+    public,
+    index(accessor = tmember_by_team, btree(columns = [team_id]))
+)]
+#[derive(Clone)]
+pub struct TeamMember {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    pub team_id: u64,
+    #[unique]
+    pub user: Identity,
+    pub role: TeamRole,
+    pub joined_at: Timestamp,
+}
+
 // Links a Match to a tournament round.
 #[table(
     accessor = tournament_match,
@@ -310,6 +364,25 @@ fn my_rack(ctx: &ViewContext) -> Vec<Holding> {
         .holding_by_bot()
         .filter(ctx.sender())
         .collect()
+}
+
+// The caller's team, with bot_token if they're the team Owner.
+#[view(accessor = my_team, public)]
+fn my_team(ctx: &ViewContext) -> Option<MyTeam> {
+    let member = ctx.db.team_member().user().find(ctx.sender())?;
+    let team = ctx.db.team().id().find(member.team_id)?;
+    let bot_token = match member.role {
+        TeamRole::Owner => Some(team.bot_token.clone()),
+        TeamRole::Member => None,
+    };
+    Some(MyTeam {
+        id: team.id,
+        name: team.name,
+        bot_name: team.bot_name,
+        bot_identity: team.bot_identity,
+        role: member.role,
+        bot_token,
+    })
 }
 
 // ---------- Lifecycle ----------
@@ -394,6 +467,149 @@ pub fn spawn_simulated_bot(
         strategy,
     });
     log::info!("Simulated bot spawned: {}", trimmed);
+    Ok(())
+}
+
+// ---------- Teams ----------
+
+// Caller (signed in via OIDC) becomes Owner of a new team. The caller's
+// browser is expected to have minted a fresh bot identity + token via an
+// anonymous connection and passes both here together with the bot name.
+#[reducer]
+pub fn create_team(
+    ctx: &ReducerContext,
+    team_name: String,
+    bot_name: String,
+    bot_identity: Identity,
+    bot_token: String,
+) -> Result<(), String> {
+    let team_name = team_name.trim().to_string();
+    let bot_name = bot_name.trim().to_string();
+    if team_name.is_empty() || team_name.len() > 48 {
+        return Err("Team name must be 1-48 characters".into());
+    }
+    if bot_name.is_empty() || bot_name.len() > 32 {
+        return Err("Bot name must be 1-32 characters".into());
+    }
+    if bot_token.is_empty() {
+        return Err("bot_token is required".into());
+    }
+    if ctx.db.team().name().find(team_name.clone()).is_some() {
+        return Err("Team name already taken".into());
+    }
+    if ctx.db.team_member().user().find(ctx.sender()).is_some() {
+        return Err("You're already on a team".into());
+    }
+    // The bot identity should already be registered via `register_bot`.
+    let bot = ctx
+        .db
+        .bot()
+        .identity()
+        .find(bot_identity)
+        .ok_or("bot_identity is not registered — call register_bot first")?;
+    if bot.name != bot_name {
+        return Err(format!(
+            "Registered bot name '{}' doesn't match supplied '{}'",
+            bot.name, bot_name
+        ));
+    }
+    if ctx.db.team().bot_identity().find(bot_identity).is_some() {
+        return Err("That bot is already on a team".into());
+    }
+
+    let team = ctx.db.team().insert(Team {
+        id: 0,
+        name: team_name.clone(),
+        bot_name,
+        bot_identity,
+        bot_token,
+        created_at: ctx.timestamp,
+    });
+    ctx.db.team_member().insert(TeamMember {
+        id: 0,
+        team_id: team.id,
+        user: ctx.sender(),
+        role: TeamRole::Owner,
+        joined_at: ctx.timestamp,
+    });
+    log::info!("Team '{}' created (id {})", team_name, team.id);
+    Ok(())
+}
+
+#[reducer]
+pub fn join_team(ctx: &ReducerContext, team_name: String) -> Result<(), String> {
+    let team_name = team_name.trim().to_string();
+    let team = ctx
+        .db
+        .team()
+        .name()
+        .find(team_name.clone())
+        .ok_or("No such team")?;
+    if ctx.db.team_member().user().find(ctx.sender()).is_some() {
+        return Err("You're already on a team".into());
+    }
+    ctx.db.team_member().insert(TeamMember {
+        id: 0,
+        team_id: team.id,
+        user: ctx.sender(),
+        role: TeamRole::Member,
+        joined_at: ctx.timestamp,
+    });
+    log::info!("User joined team '{}'", team_name);
+    Ok(())
+}
+
+#[reducer]
+pub fn leave_team(ctx: &ReducerContext) -> Result<(), String> {
+    let me = ctx
+        .db
+        .team_member()
+        .user()
+        .find(ctx.sender())
+        .ok_or("You're not on a team")?;
+    let team_id = me.team_id;
+    ctx.db.team_member().id().delete(me.id);
+    // If no members remain, delete the team too.
+    let remaining = ctx
+        .db
+        .team_member()
+        .tmember_by_team()
+        .filter(team_id)
+        .count();
+    if remaining == 0 {
+        ctx.db.team().id().delete(team_id);
+        log::info!("Team {} deleted (no members)", team_id);
+    }
+    Ok(())
+}
+
+#[reducer]
+pub fn promote_to_owner(
+    ctx: &ReducerContext,
+    target_user: Identity,
+) -> Result<(), String> {
+    let me = ctx
+        .db
+        .team_member()
+        .user()
+        .find(ctx.sender())
+        .ok_or("You're not on a team")?;
+    if me.role != TeamRole::Owner {
+        return Err("Only Owners can promote".into());
+    }
+    let target = ctx
+        .db
+        .team_member()
+        .user()
+        .find(target_user)
+        .ok_or("Target user is not on any team")?;
+    if target.team_id != me.team_id {
+        return Err("Target user is on a different team".into());
+    }
+    ctx.db.team_member().id().update(TeamMember {
+        role: TeamRole::Owner,
+        ..target
+    });
     Ok(())
 }
 

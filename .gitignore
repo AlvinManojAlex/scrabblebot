@@ -4,7 +4,6 @@ dist/
 *.log
 target/
 Cargo.lock
-.env
 .env.local
 .token-*
 src/module_bindings/
