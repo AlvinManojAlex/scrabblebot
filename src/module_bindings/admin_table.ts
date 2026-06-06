@@ -9,18 +9,9 @@ import {
   type AlgebraicTypeType as __AlgebraicTypeType,
   type Infer as __Infer,
 } from "spacetimedb";
-import {
-  AuctionType,
-} from "./types";
-
 
 export default __t.row({
-  id: __t.u32().primaryKey(),
-  enabled: __t.bool(),
-  matchSizeMin: __t.u32().name("match_size_min"),
-  matchSizeMax: __t.u32().name("match_size_max"),
-  intervalMs: __t.u64().name("interval_ms"),
-  get auctionType() {
-    return AuctionType.name("auction_type");
-  },
+  humanIdentity: __t.identity().primaryKey().name("human_identity"),
+  addedAt: __t.timestamp().name("added_at"),
+  addedBy: __t.option(__t.identity()).name("added_by"),
 });

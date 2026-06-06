@@ -9,17 +9,22 @@ import {
   type AlgebraicTypeType as __AlgebraicTypeType,
   type Infer as __Infer,
 } from "spacetimedb";
-
 import {
+  LobbyStatus,
   AuctionType,
 } from "./types";
 
-export default {
-  enabled: __t.bool(),
-  matchSizeMin: __t.u32(),
-  matchSizeMax: __t.u32(),
-  intervalMs: __t.u64(),
-  get auctionType() {
-    return AuctionType;
+
+export default __t.row({
+  id: __t.u64().primaryKey(),
+  get status() {
+    return LobbyStatus;
   },
-};
+  opensAt: __t.timestamp().name("opens_at"),
+  closesAt: __t.timestamp().name("closes_at"),
+  maxSize: __t.u32().name("max_size"),
+  get auctionType() {
+    return AuctionType.name("auction_type");
+  },
+  resolvedMatchId: __t.option(__t.u64()).name("resolved_match_id"),
+});

@@ -20,6 +20,7 @@ function Nav() {
   const humanShort = link
     ? link.humanIdentity.toHexString().slice(0, 8)
     : null;
+  const isAdmin = !!conn?.db.my_admin.iter().next().value;
 
   return (
     <nav className="nav">
@@ -29,7 +30,7 @@ function Nav() {
       <Link to="/tournament">Tournament</Link>
       <Link to="/team">Team</Link>
       <Link to="/docs">Docs</Link>
-      <Link to="/admin">Admin</Link>
+      {isAdmin && <Link to="/admin">Admin</Link>}
       <span className="conn-state">
         {connected ? "●" : "○"} {dbName}
         {" · "}

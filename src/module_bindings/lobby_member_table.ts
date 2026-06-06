@@ -10,12 +10,9 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
-import {
-  AuctionType,
-} from "./types";
-
-export default {
-  get auctionType() {
-    return AuctionType;
-  },
-};
+export default __t.row({
+  id: __t.u64().primaryKey(),
+  lobbyId: __t.u64().name("lobby_id"),
+  botId: __t.u64().name("bot_id"),
+  joinedAt: __t.timestamp().name("joined_at"),
+});

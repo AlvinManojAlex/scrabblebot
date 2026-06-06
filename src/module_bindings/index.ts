@@ -34,17 +34,18 @@ import {
 } from "spacetimedb";
 
 // Import all reducer arg schemas
+import AddAdminReducer from "./add_admin_reducer";
+import BootstrapAdminReducer from "./bootstrap_admin_reducer";
 import ClaimCredentialReducer from "./claim_credential_reducer";
 import ConnectIdReducer from "./connect_id_reducer";
 import CreateTeamReducer from "./create_team_reducer";
+import JoinLobbyReducer from "./join_lobby_reducer";
 import JoinTeamReducer from "./join_team_reducer";
 import LeaveTeamReducer from "./leave_team_reducer";
 import MintCredentialNonceReducer from "./mint_credential_nonce_reducer";
 import PromoteToOwnerReducer from "./promote_to_owner_reducer";
-import SetMatchmakerEnabledReducer from "./set_matchmaker_enabled_reducer";
+import RemoveAdminReducer from "./remove_admin_reducer";
 import SpawnSimulatedBotReducer from "./spawn_simulated_bot_reducer";
-import StartMatchReducer from "./start_match_reducer";
-import StartMatchForReducer from "./start_match_for_reducer";
 import StartTournamentReducer from "./start_tournament_reducer";
 import SubmitBidReducer from "./submit_bid_reducer";
 import SubmitWordReducer from "./submit_word_reducer";
@@ -52,15 +53,18 @@ import SubmitWordReducer from "./submit_word_reducer";
 // Import all procedure arg schemas
 
 // Import all table schema definitions
+import AdminRow from "./admin_table";
 import AuctionRow from "./auction_table";
 import AuctionResultRow from "./auction_result_table";
 import BotRow from "./bot_table";
 import BotCredentialRow from "./bot_credential_table";
 import BotStatsRow from "./bot_stats_table";
 import HumanLinkRow from "./human_link_table";
+import LobbyRow from "./lobby_table";
+import LobbyMemberRow from "./lobby_member_table";
 import MatchParticipantRow from "./match_participant_table";
 import MatchStateRow from "./match_state_table";
-import MatchmakerConfigRow from "./matchmaker_config_table";
+import MyAdminRow from "./my_admin_table";
 import MyNoncesRow from "./my_nonces_table";
 import MyRackRow from "./my_rack_table";
 import MyTeamRow from "./my_team_table";
@@ -75,6 +79,17 @@ import WordPlayRow from "./word_play_table";
 
 /** The schema information for all tables in this module. This is defined the same was as the tables would have been defined in the server. */
 const tablesSchema = __schema({
+  admin: __table({
+    name: 'admin',
+    indexes: [
+      { accessor: 'human_identity', name: 'admin_human_identity_idx_btree', algorithm: 'btree', columns: [
+        'humanIdentity',
+      ] },
+    ],
+    constraints: [
+      { name: 'admin_human_identity_key', constraint: 'unique', columns: ['humanIdentity'] },
+    ],
+  }, AdminRow),
   auction: __table({
     name: 'auction',
     indexes: [
@@ -163,6 +178,37 @@ const tablesSchema = __schema({
       { name: 'human_link_web_identity_key', constraint: 'unique', columns: ['webIdentity'] },
     ],
   }, HumanLinkRow),
+  lobby: __table({
+    name: 'lobby',
+    indexes: [
+      { accessor: 'id', name: 'lobby_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'lobby_by_status', name: 'lobby_status_idx_btree', algorithm: 'btree', columns: [
+        'status',
+      ] },
+    ],
+    constraints: [
+      { name: 'lobby_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, LobbyRow),
+  lobby_member: __table({
+    name: 'lobby_member',
+    indexes: [
+      { accessor: 'lm_by_bot', name: 'lobby_member_bot_id_idx_btree', algorithm: 'btree', columns: [
+        'botId',
+      ] },
+      { accessor: 'id', name: 'lobby_member_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'lm_by_lobby', name: 'lobby_member_lobby_id_idx_btree', algorithm: 'btree', columns: [
+        'lobbyId',
+      ] },
+    ],
+    constraints: [
+      { name: 'lobby_member_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, LobbyMemberRow),
   match_participant: __table({
     name: 'match_participant',
     indexes: [
@@ -194,17 +240,6 @@ const tablesSchema = __schema({
       { name: 'match_state_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, MatchStateRow),
-  matchmaker_config: __table({
-    name: 'matchmaker_config',
-    indexes: [
-      { accessor: 'id', name: 'matchmaker_config_id_idx_btree', algorithm: 'btree', columns: [
-        'id',
-      ] },
-    ],
-    constraints: [
-      { name: 'matchmaker_config_id_key', constraint: 'unique', columns: ['id'] },
-    ],
-  }, MatchmakerConfigRow),
   team: __table({
     name: 'team',
     indexes: [
@@ -300,6 +335,13 @@ const tablesSchema = __schema({
       { name: 'word_play_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, WordPlayRow),
+  my_admin: __table({
+    name: 'my_admin',
+    indexes: [
+    ],
+    constraints: [
+    ],
+  }, MyAdminRow),
   my_nonces: __table({
     name: 'my_nonces',
     indexes: [
@@ -325,17 +367,18 @@ const tablesSchema = __schema({
 
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
+  __reducerSchema("add_admin", AddAdminReducer),
+  __reducerSchema("bootstrap_admin", BootstrapAdminReducer),
   __reducerSchema("claim_credential", ClaimCredentialReducer),
   __reducerSchema("connect_id", ConnectIdReducer),
   __reducerSchema("create_team", CreateTeamReducer),
+  __reducerSchema("join_lobby", JoinLobbyReducer),
   __reducerSchema("join_team", JoinTeamReducer),
   __reducerSchema("leave_team", LeaveTeamReducer),
   __reducerSchema("mint_credential_nonce", MintCredentialNonceReducer),
   __reducerSchema("promote_to_owner", PromoteToOwnerReducer),
-  __reducerSchema("set_matchmaker_enabled", SetMatchmakerEnabledReducer),
+  __reducerSchema("remove_admin", RemoveAdminReducer),
   __reducerSchema("spawn_simulated_bot", SpawnSimulatedBotReducer),
-  __reducerSchema("start_match", StartMatchReducer),
-  __reducerSchema("start_match_for", StartMatchForReducer),
   __reducerSchema("start_tournament", StartTournamentReducer),
   __reducerSchema("submit_bid", SubmitBidReducer),
   __reducerSchema("submit_word", SubmitWordReducer),

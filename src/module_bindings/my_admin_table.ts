@@ -10,13 +10,8 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
-import {
-  AuctionType,
-} from "./types";
-
-export default {
-  get auctionType() {
-    return AuctionType;
-  },
-  participants: __t.array(__t.u64()),
-};
+export default __t.row({
+  humanIdentity: __t.identity().name("human_identity"),
+  addedAt: __t.timestamp().name("added_at"),
+  addedBy: __t.option(__t.identity()).name("added_by"),
+});

@@ -10,6 +10,13 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
+export const Admin = __t.object("Admin", {
+  humanIdentity: __t.identity(),
+  addedAt: __t.timestamp(),
+  addedBy: __t.option(__t.identity()),
+});
+export type Admin = __Infer<typeof Admin>;
+
 export const Auction = __t.object("Auction", {
   id: __t.u64(),
   matchId: __t.u64(),
@@ -126,6 +133,44 @@ export const HumanLink = __t.object("HumanLink", {
 });
 export type HumanLink = __Infer<typeof HumanLink>;
 
+export const Lobby = __t.object("Lobby", {
+  id: __t.u64(),
+  get status() {
+    return LobbyStatus;
+  },
+  opensAt: __t.timestamp(),
+  closesAt: __t.timestamp(),
+  maxSize: __t.u32(),
+  get auctionType() {
+    return AuctionType;
+  },
+  resolvedMatchId: __t.option(__t.u64()),
+});
+export type Lobby = __Infer<typeof Lobby>;
+
+export const LobbyMember = __t.object("LobbyMember", {
+  id: __t.u64(),
+  lobbyId: __t.u64(),
+  botId: __t.u64(),
+  joinedAt: __t.timestamp(),
+});
+export type LobbyMember = __Infer<typeof LobbyMember>;
+
+// The tagged union or sum type for the algebraic type `LobbyStatus`.
+export const LobbyStatus = __t.enum("LobbyStatus", {
+  Open: __t.unit(),
+  Resolved: __t.unit(),
+  Cancelled: __t.unit(),
+});
+export type LobbyStatus = __Infer<typeof LobbyStatus>;
+
+export const LobbyTimeoutSchedule = __t.object("LobbyTimeoutSchedule", {
+  scheduledId: __t.u64(),
+  scheduledAt: __t.scheduleAt(),
+  lobbyId: __t.u64(),
+});
+export type LobbyTimeoutSchedule = __Infer<typeof LobbyTimeoutSchedule>;
+
 export const Match = __t.object("Match", {
   id: __t.u64(),
   get status() {
@@ -159,24 +204,6 @@ export const MatchStatus = __t.enum("MatchStatus", {
   Ended: __t.unit(),
 });
 export type MatchStatus = __Infer<typeof MatchStatus>;
-
-export const MatchmakerConfig = __t.object("MatchmakerConfig", {
-  id: __t.u32(),
-  enabled: __t.bool(),
-  matchSizeMin: __t.u32(),
-  matchSizeMax: __t.u32(),
-  intervalMs: __t.u64(),
-  get auctionType() {
-    return AuctionType;
-  },
-});
-export type MatchmakerConfig = __Infer<typeof MatchmakerConfig>;
-
-export const MatchmakerSchedule = __t.object("MatchmakerSchedule", {
-  scheduledId: __t.u64(),
-  scheduledAt: __t.scheduleAt(),
-});
-export type MatchmakerSchedule = __Infer<typeof MatchmakerSchedule>;
 
 export const MyTeam = __t.object("MyTeam", {
   teamId: __t.u64(),

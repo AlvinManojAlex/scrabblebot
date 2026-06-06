@@ -15,6 +15,21 @@ const AUCTION_RESERVE: i64 = 1;
 // One hour. Long enough to copy a nonce into a bot config without hurry.
 const NONCE_TTL_SECONDS: u64 = 60 * 60;
 
+// Lobby: one open lobby at a time. Bots call `join_lobby` to enter. When
+// it fills with `LOBBY_MAX_SIZE` real bots, the match starts immediately.
+// When `LOBBY_DURATION_SECONDS` elapses, whoever's there plays, padded out
+// to `LOBBY_MAX_SIZE` with idle simulated bots.
+const LOBBY_MAX_SIZE: u32 = 6;
+const LOBBY_DURATION_SECONDS: u64 = 60;
+
+// Hardcoded seed admins — inserted by `init` on every fresh database init
+// so wiping data (e.g. `--delete-data on-conflict` during dev) doesn't lock
+// us out of the admin panel.
+const SEED_ADMIN_HEX: &[&str] = &[
+    // Tyler
+    "c200dd4e4e3e77c361561eee4c4932743ae44c634cf74819209080d98d5bc07e",
+];
+
 // ---------- Enums ----------
 
 #[derive(SpacetimeType, Clone, Debug, PartialEq)]
@@ -64,6 +79,13 @@ pub enum TournamentPhase {
 pub enum TeamRole {
     Owner,
     Member,
+}
+
+#[derive(SpacetimeType, Clone, Debug, PartialEq)]
+pub enum LobbyStatus {
+    Open,      // accepting joins
+    Resolved,  // match started
+    Cancelled, // not enough participants to start
 }
 
 // View return type — the caller's team summary.
@@ -183,6 +205,67 @@ pub struct TeamMember {
     pub user: Identity,
     pub role: TeamRole,
     pub joined_at: Timestamp,
+}
+
+// Humans who can run admin actions (start matches, configure matchmaker,
+// run tournaments, spawn simulated bots, manage other admins). Keyed by
+// spacetime.com identity (resolved via HumanLink for browser callers).
+#[table(accessor = admin, public)]
+#[derive(Clone)]
+pub struct Admin {
+    #[primary_key]
+    pub human_identity: Identity,
+    pub added_at: Timestamp,
+    // None for the bootstrapping first admin; otherwise the admin who added
+    // this one.
+    pub added_by: Option<Identity>,
+}
+
+// Lobby — one open lobby at a time accepts join_lobby calls. When it
+// fills with real bots or its timer expires, the lobby resolves into a
+// Match and a fresh Open lobby takes its place.
+#[table(
+    accessor = lobby,
+    public,
+    index(accessor = lobby_by_status, btree(columns = [status]))
+)]
+#[derive(Clone)]
+pub struct Lobby {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    pub status: LobbyStatus,
+    pub opens_at: Timestamp,
+    pub closes_at: Timestamp,
+    pub max_size: u32,
+    pub auction_type: AuctionType,
+    pub resolved_match_id: Option<u64>,
+}
+
+#[table(
+    accessor = lobby_member,
+    public,
+    index(accessor = lm_by_lobby, btree(columns = [lobby_id])),
+    index(accessor = lm_by_bot, btree(columns = [bot_id]))
+)]
+#[derive(Clone)]
+pub struct LobbyMember {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    pub lobby_id: u64,
+    pub bot_id: u64,
+    pub joined_at: Timestamp,
+}
+
+#[table(accessor = lobby_timeout_schedule, scheduled(lobby_timeout_tick))]
+#[derive(Clone)]
+pub struct LobbyTimeoutSchedule {
+    #[primary_key]
+    #[auto_inc]
+    pub scheduled_id: u64,
+    pub scheduled_at: ScheduleAt,
+    pub lobby_id: u64,
 }
 
 // Match — one row per match. id is auto_inc.
@@ -350,27 +433,6 @@ pub struct BotStats {
     pub last_played: Option<Timestamp>,
 }
 
-#[table(accessor = matchmaker_config, public)]
-#[derive(Clone)]
-pub struct MatchmakerConfig {
-    #[primary_key]
-    pub id: u32,
-    pub enabled: bool,
-    pub match_size_min: u32,
-    pub match_size_max: u32,
-    pub interval_ms: u64,
-    pub auction_type: AuctionType,
-}
-
-#[table(accessor = matchmaker_schedule, scheduled(matchmaker_tick))]
-#[derive(Clone)]
-pub struct MatchmakerSchedule {
-    #[primary_key]
-    #[auto_inc]
-    pub scheduled_id: u64,
-    pub scheduled_at: ScheduleAt,
-}
-
 #[table(accessor = tournament, public)]
 #[derive(Clone)]
 pub struct Tournament {
@@ -472,6 +534,13 @@ fn my_nonces(ctx: &ViewContext) -> Vec<CredentialNonce> {
         .collect()
 }
 
+// True iff the caller (resolved to spacetime.com identity) is an admin.
+#[view(accessor = my_admin, public)]
+fn my_admin(ctx: &ViewContext) -> Option<Admin> {
+    let human = resolve_human_view(ctx);
+    ctx.db.admin().human_identity().find(human)
+}
+
 fn resolve_human_view(ctx: &ViewContext) -> Identity {
     if let Some(link) = ctx.db.human_link().web_identity().find(ctx.sender()) {
         link.human_identity
@@ -488,6 +557,19 @@ fn resolve_human(ctx: &ReducerContext) -> Identity {
     }
 }
 
+fn caller_is_admin(ctx: &ReducerContext) -> bool {
+    let human = resolve_human(ctx);
+    ctx.db.admin().human_identity().find(human).is_some()
+}
+
+fn require_admin(ctx: &ReducerContext) -> Result<(), String> {
+    if caller_is_admin(ctx) {
+        Ok(())
+    } else {
+        Err("Admin only".into())
+    }
+}
+
 fn caller_bot_id(ctx: &ReducerContext) -> Option<u64> {
     ctx.db
         .bot_credential()
@@ -499,7 +581,71 @@ fn caller_bot_id(ctx: &ReducerContext) -> Option<u64> {
 // ---------- Lifecycle ----------
 
 #[reducer(init)]
-pub fn init(_ctx: &ReducerContext) {}
+pub fn init(ctx: &ReducerContext) {
+    // Seed admins.
+    for hex in SEED_ADMIN_HEX {
+        let identity = match Identity::from_hex(hex) {
+            Ok(id) => id,
+            Err(_) => {
+                log::error!("Bad SEED_ADMIN_HEX entry: {}", hex);
+                continue;
+            }
+        };
+        if ctx.db.admin().human_identity().find(identity).is_some() {
+            continue;
+        }
+        ctx.db.admin().insert(Admin {
+            human_identity: identity,
+            added_at: ctx.timestamp,
+            added_by: None,
+        });
+        log::info!("Seeded admin: {}", hex);
+    }
+
+    // Seed the simulated-bot pool used to pad lobby timeouts.
+    for (name, strategy) in [
+        ("Cheapo", BotStrategy::Cheapskate),
+        ("Valor", BotStrategy::ValueBidder),
+        ("Brutus", BotStrategy::Aggressive),
+        ("Hagrid", BotStrategy::ValueBidder),
+        ("Maverick", BotStrategy::Aggressive),
+        ("Snippet", BotStrategy::Cheapskate),
+    ] {
+        let _ = ensure_sim_bot(ctx, name, strategy);
+    }
+
+    // Kick off the perpetual lobby cycle.
+    open_lobby_or_create(ctx);
+}
+
+fn ensure_sim_bot(
+    ctx: &ReducerContext,
+    name: &str,
+    strategy: BotStrategy,
+) -> Result<u64, String> {
+    if let Some(bot) = ctx.db.bot().name().find(name.to_string()) {
+        return Ok(bot.id);
+    }
+    let bot = ctx.db.bot().insert(Bot {
+        id: 0,
+        name: name.to_string(),
+        team_id: 0,
+        is_simulated: true,
+        strategy,
+        created_at: ctx.timestamp,
+    });
+    let identity = Identity::from_claims("sim", name);
+    if ctx.db.bot_credential().identity().find(identity).is_none() {
+        ctx.db.bot_credential().insert(BotCredential {
+            identity,
+            bot_id: bot.id,
+            connected: true,
+            last_seen: ctx.timestamp,
+        });
+    }
+    log::info!("Seeded sim bot: {} (id {})", name, bot.id);
+    Ok(bot.id)
+}
 
 #[reducer(client_connected)]
 pub fn client_connected(ctx: &ReducerContext) {
@@ -550,6 +696,75 @@ pub fn connect_id(ctx: &ReducerContext, web_identity: Identity) -> Result<(), St
         linked_at: ctx.timestamp,
     });
     log::info!("Linked web identity to human {}", human.to_hex());
+    Ok(())
+}
+
+// ---------- Admins ----------
+
+// Claim the first admin slot. Allowed only when no admins exist yet. After
+// this, new admins must be added by an existing admin via `add_admin`.
+#[reducer]
+pub fn bootstrap_admin(ctx: &ReducerContext) -> Result<(), String> {
+    if ctx.db.admin().iter().next().is_some() {
+        return Err(
+            "Admins already exist — ask one to add you with add_admin".into(),
+        );
+    }
+    let human = resolve_human(ctx);
+    ctx.db.admin().insert(Admin {
+        human_identity: human,
+        added_at: ctx.timestamp,
+        added_by: None,
+    });
+    log::info!("Bootstrap admin: {}", human.to_hex());
+    Ok(())
+}
+
+#[reducer]
+pub fn add_admin(
+    ctx: &ReducerContext,
+    human_identity: Identity,
+) -> Result<(), String> {
+    require_admin(ctx)?;
+    if ctx
+        .db
+        .admin()
+        .human_identity()
+        .find(human_identity)
+        .is_some()
+    {
+        return Err("Already an admin".into());
+    }
+    let caller = resolve_human(ctx);
+    ctx.db.admin().insert(Admin {
+        human_identity,
+        added_at: ctx.timestamp,
+        added_by: Some(caller),
+    });
+    log::info!("Admin added: {}", human_identity.to_hex());
+    Ok(())
+}
+
+#[reducer]
+pub fn remove_admin(
+    ctx: &ReducerContext,
+    human_identity: Identity,
+) -> Result<(), String> {
+    require_admin(ctx)?;
+    let caller = resolve_human(ctx);
+    if caller == human_identity {
+        return Err("You can't remove yourself".into());
+    }
+    if ctx
+        .db
+        .admin()
+        .human_identity()
+        .find(human_identity)
+        .is_none()
+    {
+        return Err("Not an admin".into());
+    }
+    ctx.db.admin().human_identity().delete(human_identity);
     Ok(())
 }
 
@@ -796,6 +1011,7 @@ pub fn spawn_simulated_bot(
     name: String,
     strategy: BotStrategy,
 ) -> Result<(), String> {
+    require_admin(ctx)?;
     let trimmed = name.trim();
     if trimmed.is_empty() || trimmed.len() > 32 {
         return Err("Name must be 1-32 characters".into());
@@ -831,21 +1047,9 @@ pub fn spawn_simulated_bot(
 }
 
 // ---------- Match control ----------
-
-#[reducer]
-pub fn start_match(ctx: &ReducerContext, auction_type: AuctionType) -> Result<(), String> {
-    let participants: Vec<u64> = ctx.db.bot().iter().map(|b| b.id).collect();
-    start_match_with(ctx, auction_type, participants)
-}
-
-#[reducer]
-pub fn start_match_for(
-    ctx: &ReducerContext,
-    auction_type: AuctionType,
-    participants: Vec<u64>,
-) -> Result<(), String> {
-    start_match_with(ctx, auction_type, participants)
-}
+// Matches now start via the lobby flow (see `join_lobby` /
+// `lobby_timeout_tick`) or via the tournament code. There's no direct
+// public reducer to spawn a one-off match.
 
 fn start_match_with(
     ctx: &ReducerContext,
@@ -1008,105 +1212,206 @@ pub fn submit_word(
     play_word(ctx, participant, &word_upper)
 }
 
-// ---------- Matchmaker ----------
+// ---------- Lobby ----------
 
 #[reducer]
-pub fn set_matchmaker_enabled(
-    ctx: &ReducerContext,
-    enabled: bool,
-    match_size_min: u32,
-    match_size_max: u32,
-    interval_ms: u64,
-    auction_type: AuctionType,
-) -> Result<(), String> {
-    if match_size_min < 2 || match_size_max < match_size_min {
-        return Err("Need match_size_min >= 2 and max >= min".into());
+pub fn join_lobby(ctx: &ReducerContext) -> Result<(), String> {
+    let bot_id = caller_bot_id(ctx)
+        .ok_or("Your identity is not a credential for any bot")?;
+
+    // Bots can't be in two places at once.
+    if bot_in_running_match(ctx, bot_id) {
+        return Err("You're already in a running match".into());
     }
-    if interval_ms < 1000 {
-        return Err("Matchmaker interval must be >= 1000 ms".into());
+
+    let lobby = open_lobby_or_create(ctx);
+
+    // Idempotent: already in this open lobby is a no-op.
+    let already = ctx
+        .db
+        .lobby_member()
+        .lm_by_lobby()
+        .filter(lobby.id)
+        .any(|m| m.bot_id == bot_id);
+    if already {
+        return Ok(());
     }
-    let existing = ctx.db.matchmaker_config().id().find(0);
-    if let Some(cfg) = existing {
-        ctx.db.matchmaker_config().id().update(MatchmakerConfig {
-            enabled,
-            match_size_min,
-            match_size_max,
-            interval_ms,
-            auction_type,
-            ..cfg
-        });
-    } else {
-        ctx.db.matchmaker_config().insert(MatchmakerConfig {
-            id: 0,
-            enabled,
-            match_size_min,
-            match_size_max,
-            interval_ms,
-            auction_type,
-        });
-    }
-    if enabled && !is_matchmaker_scheduled(ctx) {
-        ctx.db.matchmaker_schedule().insert(MatchmakerSchedule {
-            scheduled_id: 0,
-            scheduled_at: ScheduleAt::Time(
-                ctx.timestamp + Duration::from_millis(interval_ms),
-            ),
-        });
+
+    ctx.db.lobby_member().insert(LobbyMember {
+        id: 0,
+        lobby_id: lobby.id,
+        bot_id,
+        joined_at: ctx.timestamp,
+    });
+
+    // Auto-start if the lobby is now full of REAL bots (sim bots only enter
+    // via timeout padding).
+    let real_count = ctx
+        .db
+        .lobby_member()
+        .lm_by_lobby()
+        .filter(lobby.id)
+        .filter(|m| {
+            ctx.db
+                .bot()
+                .id()
+                .find(m.bot_id)
+                .map(|b| !b.is_simulated)
+                .unwrap_or(false)
+        })
+        .count();
+    if real_count >= lobby.max_size as usize {
+        resolve_lobby(ctx, lobby.id, false);
     }
     Ok(())
 }
 
-fn is_matchmaker_scheduled(ctx: &ReducerContext) -> bool {
-    ctx.db.matchmaker_schedule().iter().next().is_some()
+#[reducer]
+pub fn lobby_timeout_tick(ctx: &ReducerContext, job: LobbyTimeoutSchedule) {
+    resolve_lobby(ctx, job.lobby_id, true);
 }
 
-#[reducer]
-pub fn matchmaker_tick(ctx: &ReducerContext, _job: MatchmakerSchedule) {
-    let cfg = match ctx.db.matchmaker_config().id().find(0) {
-        Some(c) => c,
-        None => return,
+fn bot_in_running_match(ctx: &ReducerContext, bot_id: u64) -> bool {
+    ctx.db
+        .match_participant()
+        .mp_by_bot()
+        .filter(bot_id)
+        .any(|p| {
+            ctx.db
+                .match_state()
+                .id()
+                .find(p.match_id)
+                .map(|m| m.status == MatchStatus::Running)
+                .unwrap_or(false)
+        })
+}
+
+// Returns the current open Lobby, creating one (and scheduling its timeout)
+// if none is open.
+fn open_lobby_or_create(ctx: &ReducerContext) -> Lobby {
+    if let Some(l) = ctx
+        .db
+        .lobby()
+        .lobby_by_status()
+        .filter(LobbyStatus::Open)
+        .next()
+    {
+        return l;
+    }
+    let closes_at = ctx.timestamp + Duration::from_secs(LOBBY_DURATION_SECONDS);
+    let lobby = ctx.db.lobby().insert(Lobby {
+        id: 0,
+        status: LobbyStatus::Open,
+        opens_at: ctx.timestamp,
+        closes_at,
+        max_size: LOBBY_MAX_SIZE,
+        auction_type: AuctionType::Vickrey,
+        resolved_match_id: None,
+    });
+    ctx.db.lobby_timeout_schedule().insert(LobbyTimeoutSchedule {
+        scheduled_id: 0,
+        scheduled_at: ScheduleAt::Time(closes_at),
+        lobby_id: lobby.id,
+    });
+    log::info!("Opened lobby {}", lobby.id);
+    lobby
+}
+
+// Resolve an open Lobby into a Match (when full or on timeout) and start a
+// fresh lobby in its place. `pad_with_sims` adds idle simulated bots to
+// reach max_size — only true for timeouts.
+fn resolve_lobby(ctx: &ReducerContext, lobby_id: u64, pad_with_sims: bool) {
+    let Some(lobby) = ctx.db.lobby().id().find(lobby_id) else {
+        return;
     };
-    if !cfg.enabled {
+    if !matches!(lobby.status, LobbyStatus::Open) {
+        return; // already handled
+    }
+
+    let mut roster: Vec<u64> = ctx
+        .db
+        .lobby_member()
+        .lm_by_lobby()
+        .filter(lobby_id)
+        .map(|m| m.bot_id)
+        .collect();
+
+    if pad_with_sims {
+        let in_roster: std::collections::HashSet<u64> = roster.iter().copied().collect();
+        let busy: std::collections::HashSet<u64> = ctx
+            .db
+            .match_state()
+            .iter()
+            .filter(|m| m.status == MatchStatus::Running)
+            .flat_map(|m| {
+                ctx.db
+                    .match_participant()
+                    .mp_by_match()
+                    .filter(m.id)
+                    .map(|p| p.bot_id)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut available_sims: Vec<u64> = ctx
+            .db
+            .bot()
+            .iter()
+            .filter(|b| {
+                b.is_simulated && !in_roster.contains(&b.id) && !busy.contains(&b.id)
+            })
+            .map(|b| b.id)
+            .collect();
+        // Shuffle so we don't always grab the same sim bots first.
+        for i in (1..available_sims.len()).rev() {
+            let j = ctx.rng().gen_range(0..=i);
+            available_sims.swap(i, j);
+        }
+        let need = (lobby.max_size as usize).saturating_sub(roster.len());
+        for sim_id in available_sims.into_iter().take(need) {
+            ctx.db.lobby_member().insert(LobbyMember {
+                id: 0,
+                lobby_id,
+                bot_id: sim_id,
+                joined_at: ctx.timestamp,
+            });
+            roster.push(sim_id);
+        }
+    }
+
+    if roster.len() < 2 {
+        // Not enough to play. Cancel and try again with a fresh lobby.
+        ctx.db.lobby().id().update(Lobby {
+            status: LobbyStatus::Cancelled,
+            ..lobby
+        });
+        log::warn!("Lobby {} cancelled (<2 participants)", lobby_id);
+        open_lobby_or_create(ctx);
         return;
     }
 
-    let mut busy_bot_ids = std::collections::HashSet::new();
-    let running_matches: Vec<u64> = ctx
+    let auction_type = lobby.auction_type.clone();
+    let prev_match_ids: Vec<u64> = ctx.db.match_state().iter().map(|m| m.id).collect();
+    let _ = start_match_with(ctx, auction_type, roster);
+    let new_match_id = ctx
         .db
         .match_state()
         .iter()
-        .filter(|m| m.status == MatchStatus::Running)
         .map(|m| m.id)
-        .collect();
-    for mid in &running_matches {
-        for p in ctx.db.match_participant().mp_by_match().filter(*mid) {
-            busy_bot_ids.insert(p.bot_id);
-        }
-    }
-    let mut available: Vec<u64> = ctx
-        .db
-        .bot()
-        .iter()
-        .filter(|b| !busy_bot_ids.contains(&b.id))
-        .map(|b| b.id)
-        .collect();
+        .filter(|id| !prev_match_ids.contains(id))
+        .max();
 
-    if available.len() >= cfg.match_size_min as usize {
-        let take = (cfg.match_size_max as usize).min(available.len());
-        for i in (1..available.len()).rev() {
-            let j = ctx.rng().gen_range(0..=i);
-            available.swap(i, j);
-        }
-        let roster: Vec<u64> = available.into_iter().take(take).collect();
-        let _ = start_match_with(ctx, cfg.auction_type.clone(), roster);
-    }
-
-    ctx.db.matchmaker_schedule().insert(MatchmakerSchedule {
-        scheduled_id: 0,
-        scheduled_at: ScheduleAt::Time(
-            ctx.timestamp + Duration::from_millis(cfg.interval_ms),
-        ),
+    ctx.db.lobby().id().update(Lobby {
+        status: LobbyStatus::Resolved,
+        resolved_match_id: new_match_id,
+        ..lobby
     });
+    log::info!(
+        "Lobby {} resolved -> match {:?}",
+        lobby_id,
+        new_match_id
+    );
+
+    open_lobby_or_create(ctx);
 }
 
 // ---------- Tournament ----------
@@ -1119,6 +1424,7 @@ pub fn start_tournament(
     match_size: u32,
     auction_type: AuctionType,
 ) -> Result<(), String> {
+    require_admin(ctx)?;
     if match_size < 2 {
         return Err("Tournament match_size must be >= 2".into());
     }

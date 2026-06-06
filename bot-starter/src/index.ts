@@ -196,9 +196,45 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} (bid ${r.topBid}, paid ${r.paid})`,
     );
   });
+
+  // When a match this bot was in ends, hop back into the lobby.
+  conn.db.match_state.onUpdate((_ctx, old, neu) => {
+    if (myBotId === null) return;
+    if (old.status.tag !== "Ended" && neu.status.tag === "Ended") {
+      const wasIn = Array.from(conn.db.match_participant.iter()).some(
+        (p) => p.matchId === neu.id && p.botId === myBotId,
+      );
+      if (wasIn) {
+        console.log(`[${BOT_NAME}] match ${neu.id} ended; rejoining lobby`);
+        joinLobby(conn);
+      }
+    }
+  });
+}
+
+function joinLobby(conn: DbConnection) {
+  if (myBotId === null) return;
+  const inRunning = Array.from(conn.db.match_participant.iter()).some((p) => {
+    if (p.botId !== myBotId) return false;
+    const m = conn.db.match_state.id.find(p.matchId);
+    return m?.status.tag === "Running";
+  });
+  if (inRunning) return;
+  const openLobby = Array.from(conn.db.lobby.iter()).find(
+    (l) => l.status.tag === "Open",
+  );
+  const alreadyIn =
+    openLobby !== undefined &&
+    Array.from(conn.db.lobby_member.iter()).some(
+      (lm) => lm.lobbyId === openLobby.id && lm.botId === myBotId,
+    );
+  if (alreadyIn) return;
+  console.log(`[${BOT_NAME}] joining lobby`);
+  conn.reducers.joinLobby({});
 }
 
 function bootstrapActivity(conn: DbConnection) {
+  joinLobby(conn);
   for (const a of conn.db.auction.iter()) {
     if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
   }

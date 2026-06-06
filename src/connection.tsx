@@ -76,7 +76,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
           c.db.auction,
           c.db.auction_result,
           c.db.word_play,
-          c.db.matchmaker_config,
+          c.db.lobby,
+          c.db.lobby_member,
           c.db.tournament,
           c.db.tournament_entry,
           c.db.tournament_match,
@@ -86,6 +87,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
           c.db.human_link,
           c.db.my_team,
           c.db.my_nonces,
+          c.db.admin,
+          c.db.my_admin,
         ]) {
           const anyT = t as unknown as {
             onInsert: (cb: () => void) => void;
