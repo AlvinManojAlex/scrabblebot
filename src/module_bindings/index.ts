@@ -73,6 +73,7 @@ import TeamMemberRow from "./team_member_table";
 import TournamentRow from "./tournament_table";
 import TournamentEntryRow from "./tournament_entry_table";
 import TournamentMatchRow from "./tournament_match_table";
+import VisibleAuctionTopBidsRow from "./visible_auction_top_bids_table";
 import WordPlayRow from "./word_play_table";
 
 /** Type-only namespace exports for generated type groups. */
@@ -363,6 +364,13 @@ const tablesSchema = __schema({
     constraints: [
     ],
   }, MyTeamRow),
+  visible_auction_top_bids: __table({
+    name: 'visible_auction_top_bids',
+    indexes: [
+    ],
+    constraints: [
+    ],
+  }, VisibleAuctionTopBidsRow),
 });
 
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */

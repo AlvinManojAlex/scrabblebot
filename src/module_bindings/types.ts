@@ -34,7 +34,6 @@ export const AuctionResult = __t.object("AuctionResult", {
   matchId: __t.u64(),
   letter: __t.string(),
   winnerBotId: __t.option(__t.u64()),
-  topBid: __t.i64(),
   paid: __t.i64(),
   closedAt: __t.timestamp(),
 });
@@ -53,6 +52,14 @@ export const AuctionStatus = __t.enum("AuctionStatus", {
   Closed: __t.unit(),
 });
 export type AuctionStatus = __Infer<typeof AuctionStatus>;
+
+export const AuctionTopBid = __t.object("AuctionTopBid", {
+  auctionId: __t.u64(),
+  matchId: __t.u64(),
+  topBid: __t.i64(),
+  visible: __t.bool(),
+});
+export type AuctionTopBid = __Infer<typeof AuctionTopBid>;
 
 // The tagged union or sum type for the algebraic type `AuctionType`.
 export const AuctionType = __t.enum("AuctionType", {

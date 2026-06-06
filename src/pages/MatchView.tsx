@@ -59,6 +59,15 @@ export default function MatchView() {
   }
   allPlays.sort((a, b) => Number(a.id - b.id));
 
+  // top_bid lives in a private table exposed via the
+  // `visible_auction_top_bids` view (hidden from bot clients).
+  const topBidByAuction = new Map<string, bigint>();
+  for (const t of conn.db.visible_auction_top_bids.iter()) {
+    if (t.matchId === matchId) {
+      topBidByAuction.set(String(t.auctionId), t.topBid);
+    }
+  }
+
   const racks = reconstructRacks(allResults, allPlays);
 
   const now = Date.now();
@@ -108,19 +117,22 @@ export default function MatchView() {
             {allResults
               .slice(-10)
               .reverse()
-              .map((r) => (
-                <tr key={String(r.auctionId)}>
-                  <td>{String(r.auctionId)}</td>
-                  <td>{r.letter}</td>
-                  <td>
-                    {r.winnerBotId !== undefined && r.winnerBotId !== null
-                      ? botName(bots, r.winnerBotId)
-                      : "no bid"}
-                  </td>
-                  <td className="num">{String(r.topBid)}</td>
-                  <td className="num">{String(r.paid)}</td>
-                </tr>
-              ))}
+              .map((r) => {
+                const topBid = topBidByAuction.get(String(r.auctionId));
+                return (
+                  <tr key={String(r.auctionId)}>
+                    <td>{String(r.auctionId)}</td>
+                    <td>{r.letter}</td>
+                    <td>
+                      {r.winnerBotId !== undefined && r.winnerBotId !== null
+                        ? botName(bots, r.winnerBotId)
+                        : "no bid"}
+                    </td>
+                    <td className="num">{topBid !== undefined ? String(topBid) : "—"}</td>
+                    <td className="num">{String(r.paid)}</td>
+                  </tr>
+                );
+              })}
           </tbody>
         </table>
       </section>

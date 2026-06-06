@@ -193,7 +193,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
         ? String(r.winnerBotId)
         : "no-bid";
     console.log(
-      `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} (bid ${r.topBid}, paid ${r.paid})`,
+      `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} paid ${r.paid}`,
     );
   });
 

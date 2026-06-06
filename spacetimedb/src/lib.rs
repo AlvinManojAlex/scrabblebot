@@ -21,6 +21,10 @@ const NONCE_TTL_SECONDS: u64 = 60 * 60;
 // to `LOBBY_MAX_SIZE` with idle simulated bots.
 const LOBBY_MAX_SIZE: u32 = 6;
 const LOBBY_DURATION_SECONDS: u64 = 90;
+// Each bot is dealt this many tiles from the bag at match start. They go
+// straight into Holding (private), so opponents can't see them until the
+// bot plays them in a word.
+const STARTING_RACK_SIZE: u32 = 5;
 
 // Hardcoded seed admins — inserted by `init` on every fresh database init
 // so wiping data (e.g. `--delete-data on-conflict` during dev) doesn't lock
@@ -385,9 +389,29 @@ pub struct AuctionResult {
     pub match_id: u64,
     pub letter: String,
     pub winner_bot_id: Option<u64>,
-    pub top_bid: i64,
     pub paid: i64,
     pub closed_at: Timestamp,
+}
+
+// Private — the winner's top bid is interesting to spectators but is
+// sensitive info that bots shouldn't see (it leaks the winner's true
+// valuation and undermines Vickrey's truth-telling). Exposed through the
+// `visible_auction_top_bids` view, which returns empty for callers that
+// hold a BotCredential.
+#[table(
+    accessor = auction_top_bid,
+    index(accessor = top_bid_visible, btree(columns = [visible]))
+)]
+#[derive(Clone)]
+pub struct AuctionTopBid {
+    #[primary_key]
+    pub auction_id: u64,
+    pub match_id: u64,
+    pub top_bid: i64,
+    // Always true. Required because SpacetimeDB views in 2.2 can't iterate
+    // arbitrary tables — only filter by an indexed column. We index on
+    // this and filter by `true` to enumerate everything in the view.
+    pub visible: bool,
 }
 
 #[table(
@@ -521,6 +545,27 @@ fn my_team(ctx: &ViewContext) -> Option<MyTeam> {
         role: member.role,
         credential_count,
     })
+}
+
+// Spectator-only view of the winning bid amount. Callers that hold a
+// BotCredential (real bots in the game) get an empty Vec; everyone else
+// sees the data.
+#[view(accessor = visible_auction_top_bids, public)]
+fn visible_auction_top_bids(ctx: &ViewContext) -> Vec<AuctionTopBid> {
+    if ctx
+        .db
+        .bot_credential()
+        .identity()
+        .find(ctx.sender())
+        .is_some()
+    {
+        return vec![];
+    }
+    ctx.db
+        .auction_top_bid()
+        .top_bid_visible()
+        .filter(true)
+        .collect()
 }
 
 // Nonces the caller has minted. Private to the caller.
@@ -1093,6 +1138,38 @@ fn start_match_with(
             letter: letter.to_string(),
             remaining: *count,
         });
+    }
+
+    // Deal each participant a starting rack from the bag. These tiles are
+    // hidden from opponents (Holding is private) and only become derivable
+    // when a bot plays a word with them.
+    for bot_id in &participants {
+        let bid = *bot_id;
+        for _ in 0..STARTING_RACK_SIZE {
+            let Some(letter) = draw_letter(ctx, match_id) else {
+                break;
+            };
+            let existing: Option<Holding> = ctx
+                .db
+                .holding()
+                .holding_by_bot()
+                .filter(bid)
+                .find(|h| h.match_id == match_id && h.letter == letter);
+            if let Some(h) = existing {
+                ctx.db.holding().id().update(Holding {
+                    count: h.count + 1,
+                    ..h
+                });
+            } else {
+                ctx.db.holding().insert(Holding {
+                    id: 0,
+                    match_id,
+                    bot_id: bid,
+                    letter,
+                    count: 1,
+                });
+            }
+        }
     }
 
     let first_letter = draw_letter(ctx, match_id).ok_or("Bag empty")?;
@@ -2008,9 +2085,16 @@ pub fn auction_tick(ctx: &ReducerContext, job: AuctionSchedule) {
         match_id,
         letter: auction.letter.clone(),
         winner_bot_id: winner,
-        top_bid,
         paid,
         closed_at: ctx.timestamp,
+    });
+    // Spectator-visible mirror of the winning bid (gated through the
+    // `visible_auction_top_bids` view so bots can't see it).
+    ctx.db.auction_top_bid().insert(AuctionTopBid {
+        auction_id,
+        match_id,
+        top_bid,
+        visible: true,
     });
     ctx.db.auction().id().update(Auction {
         status: AuctionStatus::Closed,
