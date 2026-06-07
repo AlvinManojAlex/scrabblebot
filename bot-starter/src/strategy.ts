@@ -10,6 +10,12 @@ export const LETTER_VALUE: Record<string, number> = {
   U: 1, V: 4, W: 4, X: 8, Y: 4, Z: 10,
 };
 
+const VOWELS = new Set(['A', 'E', 'I', 'O', 'U']);
+
+// Rack balance — bidding adjustments when vowel/consonant ratio is off.
+const CONSONANT_PENALTY = 0.3; // suppress consonant bids when rack is vowel-deficient
+const VOWEL_BOOST       = 1.5; // boost vowel bids when rack has zero vowels
+
 // Matches Rust's integer arithmetic in length_multiplier() exactly.
 // 4-letter: floor(base * 3/2), 6-letter: floor(base * 5/2)
 export function computeTotalReward(word: string): number {
@@ -155,7 +161,7 @@ export interface BidContext {
 
 const NUM_SIMS = 150;
 const MAX_LOOKAHEAD = 4;   // future letters sampled per simulation
-const BUDGET_FRACTION = 0.4;
+const BUDGET_FRACTION = 0.25;
 const BALANCE_FLOOR = 5;   // keep at least this many coins in reserve
 
 export function decideBid(ctx: BidContext): number {
@@ -185,7 +191,24 @@ export function decideBid(ctx: BidContext): number {
       bestReward(ctx.trie, rackWithout, 0);
   }
 
-  const trueValue = marginalSum / NUM_SIMS;
+  let trueValue = marginalSum / NUM_SIMS;
+
+  // Rack balance: adjust bid based on vowel/consonant ratio.
+  // If the rack is consonant-heavy, additional consonants are nearly useless
+  // without vowels to pair them with; vowels become urgently needed.
+  const vowelCount = [...ctx.myRack.entries()]
+    .filter(([l]) => VOWELS.has(l))
+    .reduce((s, [, c]) => s + c, 0);
+  const rackSize = [...ctx.myRack.values()].reduce((s, c) => s + c, 0);
+  const isVowel = VOWELS.has(ctx.letter);
+  if (rackSize >= 2) {
+    const vowelRatio = vowelCount / rackSize;
+    if (!isVowel && vowelRatio < 0.2) {
+      trueValue *= CONSONANT_PENALTY; // far too many consonants already
+    } else if (isVowel && vowelCount === 0) {
+      trueValue *= VOWEL_BOOST;       // no vowels at all — urgently need one
+    }
+  }
 
   // Scarcity premium: fewer remaining tiles → fewer future chances → bid more.
   const remaining = ctx.bagRemaining.get(ctx.letter) ?? 0;
@@ -206,22 +229,15 @@ export function decideBid(ctx: BidContext): number {
 export interface WordContext {
   myRack: Map<string, number>;
   trie: TrieNode;
-  bagRemaining: Map<string, number>; // for hold-vs-play MC check
+  bagRemaining: Map<string, number>;
   bagTotal: number;
   myBalance: number;
 }
 
-const TOP_K_WORDS = 20;
-const LEAVE_DISCOUNT = 0.5;  // discount on leave value — future plays are uncertain
-const N_HOLD_SIMS = 50;      // MC sims for hold estimate
-const K_HOLD = 3;            // letters drawn per hold sim
-const PLAY_FACTOR_BASE = 0.6; // early-game: play only if current ≥ 60% of expected future
-const LOW_BALANCE = 15;       // below this coins, lower the hold threshold
-
-// Approximate bag size at match start (98 total − 5 starting tiles per bot;
-// with 6 bots that's 68, but opponents' starting tiles are unknown so we use
-// 93 as a conservative approximation for the progress denominator).
-const INITIAL_BAG_APPROX = 93;
+const N_WORD_SIMS    = 40;  // MC simulations for hold-vs-play
+const K_WORD         = 3;   // letters drawn per simulation
+const MAX_CANDIDATES = 15;  // top words evaluated with MC (by raw reward)
+const LOW_BALANCE    = 15;  // below this coins, lower the hold threshold
 
 export function chooseWord(ctx: WordContext): string | null {
   const rack: Record<string, number> = {};
@@ -231,44 +247,53 @@ export function chooseWord(ctx: WordContext): string | null {
   collectPlayable(ctx.trie, rack, "", playable);
   if (playable.length === 0) return null;
 
-  // Sort by raw reward, evaluate top-K candidates with leave value.
+  // Take top candidates by raw reward — they're the most likely winners.
   playable.sort((a, b) => b.reward - a.reward);
-  const candidates = playable.slice(0, TOP_K_WORDS);
+  const candidates = playable.slice(0, MAX_CANDIDATES);
 
+  // Pre-generate shared simulation draws so all evaluations use the same futures.
+  const lookahead = Math.min(ctx.bagTotal, K_WORD);
+  const simDraws: string[][] = [];
+  for (let i = 0; i < N_WORD_SIMS; i++) {
+    simDraws.push(sampleFromBag(ctx.bagRemaining, ctx.bagTotal, lookahead));
+  }
+
+  // E[hold] = expected best reward from keeping ALL current tiles + future draws.
+  // This is the opportunity cost of playing any word.
+  let holdSum = 0;
+  for (const drawn of simDraws) {
+    const futureRack: Record<string, number> = { ...rack };
+    for (const l of drawn) futureRack[l] = (futureRack[l] ?? 0) + 1;
+    holdSum += bestReward(ctx.trie, futureRack, 0);
+  }
+  const expectedHold = holdSum / N_WORD_SIMS;
+
+  // For each candidate word W:
+  //   E[play(W)] = reward(W) + E[future(leave(W) + draws)]
+  // Play W if E[play(W)] > E[hold] — i.e., playing W beats holding everything.
   let bestWord: string | null = null;
-  let bestAdjusted = -1;
+  let bestPlayValue = -Infinity;
 
   for (const { word, reward } of candidates) {
     const leave: Record<string, number> = { ...rack };
     for (const ch of word) leave[ch]!--;
-    const leaveVal = bestReward(ctx.trie, leave, 0);
-    const adjusted = reward + LEAVE_DISCOUNT * leaveVal;
-    if (adjusted > bestAdjusted) {
-      bestAdjusted = adjusted;
+
+    let leaveSum = 0;
+    for (const drawn of simDraws) {
+      const futureLeave: Record<string, number> = { ...leave };
+      for (const l of drawn) futureLeave[l] = (futureLeave[l] ?? 0) + 1;
+      leaveSum += bestReward(ctx.trie, futureLeave, 0);
+    }
+    const playValue = reward + leaveSum / N_WORD_SIMS;
+
+    if (playValue > bestPlayValue) {
+      bestPlayValue = playValue;
       bestWord = word;
     }
   }
 
-  // ---------- Hold-vs-play MC check ----------
-  // Estimate the expected reward if we hold current tiles and draw more letters.
-  // Only play now if bestAdjusted meets the dynamic threshold.
-  const lookahead = Math.min(ctx.bagTotal, K_HOLD);
-  let futureSum = 0;
-  for (let i = 0; i < N_HOLD_SIMS; i++) {
-    const drawn = sampleFromBag(ctx.bagRemaining, ctx.bagTotal, lookahead);
-    const futureRack: Record<string, number> = { ...rack };
-    for (const l of drawn) futureRack[l] = (futureRack[l] ?? 0) + 1;
-    futureSum += bestReward(ctx.trie, futureRack, 0);
-  }
-  const expectedFuture = futureSum / N_HOLD_SIMS;
-
-  // playFactor rises from PLAY_FACTOR_BASE → 1.0 as the bag empties.
-  const bagProgress = Math.min(1, 1 - ctx.bagTotal / INITIAL_BAG_APPROX);
-  let playFactor = PLAY_FACTOR_BASE + (1 - PLAY_FACTOR_BASE) * bagProgress;
-  // Lower the bar if balance is running low — need to earn coins to keep bidding.
-  if (ctx.myBalance < LOW_BALANCE) playFactor *= 0.75;
-
-  if (bestAdjusted < expectedFuture * playFactor) return null; // hold
-
+  // Lower hold threshold slightly when balance is low — need coins to keep bidding.
+  const holdThreshold = ctx.myBalance < LOW_BALANCE ? expectedHold * 0.85 : expectedHold;
+  if (bestPlayValue < holdThreshold) return null;
   return bestWord;
 }
