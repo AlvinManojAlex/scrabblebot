@@ -17,4 +17,6 @@ export default __t.row({
   wins: __t.u32(),
   totalScore: __t.i64().name("total_score"),
   lastPlayed: __t.option(__t.timestamp()).name("last_played"),
+  openskillMu: __t.f64().name("openskill_mu"),
+  openskillSigma: __t.f64().name("openskill_sigma"),
 });

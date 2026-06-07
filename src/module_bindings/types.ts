@@ -110,6 +110,8 @@ export const BotStats = __t.object("BotStats", {
   wins: __t.u32(),
   totalScore: __t.i64(),
   lastPlayed: __t.option(__t.timestamp()),
+  openskillMu: __t.f64(),
+  openskillSigma: __t.f64(),
 });
 export type BotStats = __Infer<typeof BotStats>;
 
