@@ -161,16 +161,28 @@ export interface BidContext {
 
 const NUM_SIMS = 150;
 const MAX_LOOKAHEAD = 4;    // future letters sampled per simulation
-const BUDGET_FRACTION = 0.25;
-const BALANCE_FLOOR = 5;    // keep at least this many coins in reserve
-// Clamped fractional floors — start high early game, decay smoothly, never
-// drop below the minimum. budgetCap (balance × 0.25) takes over when very low.
-const VOWEL_FLOOR_MAX      = 15;  // ceiling — rises above 13 when balance is high (post word-play)
-const VOWEL_FLOOR_MIN      = 10;  // mid/late-game guarantee
-const VOWEL_FLOOR_FRAC     = 0.13;
-const CONSONANT_FLOOR_MAX  = 11;
-const CONSONANT_FLOOR_MIN  = 7;
-const CONSONANT_FLOOR_FRAC = 0.09;
+const BUDGET_FRACTION = 0.28;
+const BALANCE_FLOOR = 5;
+
+// Vowel floors — all vowels are scaffold for 7-letter words; E and I slightly stronger.
+const HIGH_VOWELS          = new Set(['E', 'I']);
+const HI_VOWEL_FLOOR_MAX   = 22;
+const HI_VOWEL_FLOOR_FRAC  = 0.18;  // at balance 100: 18 → ×boost ~23
+const VOWEL_FLOOR_MAX      = 18;
+const VOWEL_FLOOR_MIN      = 11;
+const VOWEL_FLOOR_FRAC     = 0.16;  // at balance 100: 16 → ×boost ~21
+
+// Consonant tiers (derived from VinceBot analysis — dominant strategy is QZJX+vowels):
+//   PREMIUM (very high floor): Q, Z, J, X — anchor 7-letter 3× words (CAZIQUE, JUKEBOX, etc.)
+//   HIGH    (full floor):      C, H, Y, K, F, V, W — value density / unlock rate
+//   COMMON  (min floor):       N,R,T,S,L,D,G,M,B,P — plentiful connectors; let MC lead
+const PREMIUM_CONSONANTS   = new Set(['J', 'Q', 'X', 'Z']);
+const HIGH_CONSONANTS      = new Set(['C', 'H', 'Y', 'K', 'F', 'V', 'W']);
+const PREMIUM_FLOOR_MAX    = 25;
+const PREMIUM_FLOOR_FRAC   = 0.22;  // at balance 100: 22 → ×boost ~28 (budget-cap limited)
+const CONSONANT_FLOOR_MAX  = 14;
+const CONSONANT_FLOOR_MIN  = 8;
+const CONSONANT_FLOOR_FRAC = 0.12;
 
 export function decideBid(ctx: BidContext): number {
   if (ctx.myBalance <= 0) return 0;
@@ -227,13 +239,33 @@ export function decideBid(ctx: BidContext): number {
     Math.min(ctx.myBalance * BUDGET_FRACTION, ctx.myBalance - BALANCE_FLOOR),
   );
 
-  // Competitive floor: always bid at least a fraction of balance so we stay
-  // in the market (MC marginal values can be systematically low when the
-  // starting rack is already letter-rich).
-  const competitiveFloor = isVowel
-    ? Math.max(VOWEL_FLOOR_MIN, Math.min(VOWEL_FLOOR_MAX, Math.floor(ctx.myBalance * VOWEL_FLOOR_FRAC)))
-    : Math.max(CONSONANT_FLOOR_MIN, Math.min(CONSONANT_FLOOR_MAX, Math.floor(ctx.myBalance * CONSONANT_FLOOR_FRAC)));
-  const effective = Math.max(trueValue * scarcity, competitiveFloor);
+  // Duplicate penalty: already holding 2+ of this letter → halve the floor so
+  // the MC's naturally-low marginal value drives the bid instead of the floor
+  // forcing us to over-invest in a 3rd+ copy of the same letter.
+  const duplicateHeld = ctx.myRack.get(ctx.letter) ?? 0;
+  const floorMult = duplicateHeld >= 2 ? 0.5 : 1.0;
+
+  // Consonant floor by tier.
+  let consonantFloor: number;
+  if (PREMIUM_CONSONANTS.has(ctx.letter)) {
+    // Q/Z/J/X: bid aggressively — these anchor 7-letter 3× words (CAZIQUE, JUKEBOX, SQUEEZE…)
+    consonantFloor = Math.max(CONSONANT_FLOOR_MIN, Math.min(PREMIUM_FLOOR_MAX, Math.floor(ctx.myBalance * PREMIUM_FLOOR_FRAC)));
+  } else if (HIGH_CONSONANTS.has(ctx.letter)) {
+    consonantFloor = Math.max(CONSONANT_FLOOR_MIN, Math.min(CONSONANT_FLOOR_MAX, Math.floor(ctx.myBalance * CONSONANT_FLOOR_FRAC)));
+  } else {
+    consonantFloor = CONSONANT_FLOOR_MIN;  // common consonants: let MC lead
+  }
+
+  // Vowel floor: E and I get a stronger floor than A/O/U.
+  const vowelFloor = HIGH_VOWELS.has(ctx.letter)
+    ? Math.max(VOWEL_FLOOR_MIN, Math.min(HI_VOWEL_FLOOR_MAX, Math.floor(ctx.myBalance * HI_VOWEL_FLOOR_FRAC)))
+    : Math.max(VOWEL_FLOOR_MIN, Math.min(VOWEL_FLOOR_MAX, Math.floor(ctx.myBalance * VOWEL_FLOOR_FRAC)));
+
+  const competitiveFloor = floorMult * (isVowel ? vowelFloor : consonantFloor);
+  // Early-game boost: bid more aggressively when bag is still full.
+  // Fades linearly from 1.3× (bag ≥ 65 tiles) to 1.0× (bag ≤ 10 tiles).
+  const earlyBoost = 1 + 0.3 * Math.max(0, Math.min(1, (ctx.bagTotal - 10) / 55));
+  const effective = Math.max(trueValue * scarcity, competitiveFloor) * earlyBoost;
   const raw = Math.round(Math.min(effective, budgetCap));
   if (raw < 1 && trueValue > 0 && ctx.myBalance > 0) return 1;
   return Math.max(0, Math.min(raw, ctx.myBalance));
@@ -252,7 +284,10 @@ export interface WordContext {
 const N_WORD_SIMS    = 40;  // MC simulations for hold-vs-play
 const K_WORD         = 3;   // letters drawn per simulation
 const MAX_CANDIDATES = 15;  // top words evaluated with MC (by raw reward)
-const LOW_BALANCE    = 15;  // below this coins, lower the hold threshold
+const LOW_BALANCE    = 20;  // below this coins, lower the hold threshold
+// Bag-zone thresholds for hold multiplier
+const BAG_EARLY      = 40;  // bag > 40: conservative (don't play weak words)
+const BAG_ENDGAME    = 15;  // bag < 15: aggressive (play whatever you have)
 
 export function chooseWord(ctx: WordContext): string | null {
   const rack: Record<string, number> = {};
@@ -307,8 +342,17 @@ export function chooseWord(ctx: WordContext): string | null {
     }
   }
 
-  // Lower hold threshold slightly when balance is low — need coins to keep bidding.
-  const holdThreshold = ctx.myBalance < LOW_BALANCE ? expectedHold * 0.85 : expectedHold;
+  // Bag-aware hold multiplier:
+  //   Early game (bag > 40): require play to beat hold by 15% — prevents weak plays like OFAY
+  //   Mid game (15–40):      standard — play only if E[play] > E[hold]
+  //   End game (bag < 15):   slash threshold 25% — bag nearly empty, take what you can get
+  //   Low balance override:  cap at 0.9 so we recoup coins via word score
+  let holdMult = ctx.bagTotal > BAG_EARLY   ? 1.15
+               : ctx.bagTotal < BAG_ENDGAME ? 0.75
+               : 1.0;
+  if (ctx.myBalance < LOW_BALANCE) holdMult = Math.min(holdMult, 0.9);
+
+  const holdThreshold = expectedHold * holdMult;
   if (bestPlayValue < holdThreshold) return null;
   return bestWord;
 }
