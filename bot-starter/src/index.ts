@@ -28,6 +28,7 @@ const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
 const BOT_NAME = process.env.BOT_NAME ?? "bot";
 const BOT_NONCE = process.env.BOT_NONCE; // only used on first run
+const TOURNAMENT_MODE = !!process.env.TOURNAMENT_MODE; // set to skip casual lobby
 const TOKEN_PATH = path.join(process.cwd(), `.token-${BOT_NAME}`);
 
 function loadToken(): string | undefined {
@@ -299,6 +300,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
 }
 
 function joinLobby(conn: DbConnection) {
+  if (TOURNAMENT_MODE) return; // stay out of casual lobby during tournament
   if (myBotId === null) return;
   const inRunning = Array.from(conn.db.match_participant.iter()).some((p) => {
     if (p.botId !== myBotId) return false;
@@ -321,7 +323,15 @@ function joinLobby(conn: DbConnection) {
   });
 }
 
+const TOURNAMENT_ID = process.env.TOURNAMENT_ID ? BigInt(process.env.TOURNAMENT_ID) : null;
+
 function bootstrapActivity(conn: DbConnection) {
+  if (TOURNAMENT_MODE && TOURNAMENT_ID !== null) {
+    console.log(`[${BOT_NAME}] registering for tournament ${TOURNAMENT_ID}`);
+    conn.reducers.registerForTournament({ tournamentId: TOURNAMENT_ID }).catch((err: Error) => {
+      console.warn(`[${BOT_NAME}] tournament registration failed: ${err.message}`);
+    });
+  }
   joinLobby(conn);
   for (const a of conn.db.auction.iter()) {
     if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
