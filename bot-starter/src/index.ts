@@ -22,7 +22,7 @@ import {
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { chooseWord, decideBid, MIN_WORD_SCORE, MAX_RACK_LETTERS } from "./strategy.js";
+import { buildTrie, chooseWord, decideBid, type TrieNode } from "./strategy.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -41,7 +41,7 @@ function saveToken(tok: string) {
   fs.writeFileSync(TOKEN_PATH, tok);
 }
 
-// Load the shared wordlist so the bot can pick playable words locally.
+// Load the shared wordlist and build the trie once at startup.
 const dictionaryPath = path.join(
   path.dirname(new URL(import.meta.url).pathname),
   "..",
@@ -56,13 +56,24 @@ const DICTIONARY: string[] = fs.existsSync(dictionaryPath)
       .map((l) => l.trim().toUpperCase())
       .filter((l) => l.length >= 2)
   : [];
-DICTIONARY.sort((a, b) => b.length - a.length); // longest first for greedy pick
+
+console.log(`[${BOT_NAME}] building trie from ${DICTIONARY.length} words…`);
+const t0 = Date.now();
+const TRIE: TrieNode = buildTrie(DICTIONARY);
+console.log(`[${BOT_NAME}] trie built in ${Date.now() - t0}ms`);
+
+// Standard Scrabble bag — must match DEFAULT_BAG in spacetimedb/src/letters.rs.
+const DEFAULT_BAG: Record<string, number> = {
+  A: 9, B: 2, C: 2, D: 4,  E: 12, F: 2, G: 3, H: 2, I: 9, J: 1,
+  K: 1, L: 4, M: 2, N: 6,  O: 8,  P: 2, Q: 1, R: 6, S: 4, T: 6,
+  U: 4, V: 2, W: 2, X: 1,  Y: 2,  Z: 1,
+};
+const STARTING_RACK_SIZE = 5; // must match server constant
 
 let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
 const bidsByAuction = new Set<string>();
 const lastWordAttemptByMatch = new Map<string, number>();
-const auctionCountByMatch = new Map<string, number>();
 const WORD_RETRY_MS = 500;
 
 function resolveMyBotId(conn: DbConnection): bigint | null {
@@ -93,33 +104,90 @@ function participantForMatch(
   return null;
 }
 
+// Estimates per-letter tile counts remaining in the bag for a given match.
+// Uses public auction_result + our own rack + a proportional estimate for
+// opponents' hidden starting racks.
+function computeBagRemaining(
+  conn: DbConnection,
+  matchId: bigint,
+  myRack: Map<string, number>,
+  numParticipants: number,
+): Map<string, number> {
+  const bag: Record<string, number> = { ...DEFAULT_BAG };
+
+  // Subtract letters that were WON at auction.
+  // CRITICAL: winnerBotId === null means the letter was returned to the bag
+  // (return_to_bag on the server). Do NOT subtract those.
+  for (const r of conn.db.auction_result.iter()) {
+    if (r.matchId !== matchId) continue;
+    if (r.winnerBotId !== null && r.winnerBotId !== undefined) {
+      bag[r.letter] = (bag[r.letter] ?? 0) - 1;
+    }
+  }
+
+  // Subtract the currently open auction letter — it has been drawn from the
+  // bag but is not yet in auction_result.
+  for (const a of conn.db.auction.iter()) {
+    if (a.matchId !== matchId) continue;
+    if (a.status.tag === "Open") {
+      bag[a.letter] = (bag[a.letter] ?? 0) - 1;
+    }
+  }
+
+  // Subtract our own rack (definitely consumed from the bag).
+  for (const [letter, count] of myRack) {
+    bag[letter] = (bag[letter] ?? 0) - count;
+  }
+
+  // Estimate opponents' starting tiles (5 per bot). We can't see their hands,
+  // so subtract proportionally to the original distribution.
+  const numOthers = Math.max(0, numParticipants - 1);
+  const unknownTiles = numOthers * STARTING_RACK_SIZE;
+  const bagTotal98 = 98;
+  for (const [letter, defaultCount] of Object.entries(DEFAULT_BAG)) {
+    const proportion = defaultCount / bagTotal98;
+    bag[letter] = (bag[letter] ?? 0) - Math.round(proportion * unknownTiles);
+  }
+
+  // Clamp all to 0.
+  return new Map(Object.entries(bag).map(([k, v]) => [k, Math.max(0, v)]));
+}
+
 function tryBid(conn: DbConnection, auctionId: bigint, matchId: bigint, letter: string) {
   if (myBotId === null) return;
   const key = `${matchId}:${auctionId}`;
   if (bidsByAuction.has(key)) return;
+
   const participant = participantForMatch(conn, matchId);
   if (!participant) return;
-  const matchState = conn.db.match_state.id.find(matchId);
-  const auctionType = matchState?.auctionType.tag === "FirstPrice" ? "FirstPrice" : "Vickrey";
-  const participantCount = Array.from(conn.db.match_participant.iter()).filter(
+
+  const myRack = rackForMatch(conn, matchId);
+  const numParticipants = Array.from(conn.db.match_participant.iter()).filter(
     (p) => p.matchId === matchId,
   ).length;
+  const bagRemaining = computeBagRemaining(conn, matchId, myRack, numParticipants);
+  const bagTotal = Number(conn.db.match_state.id.find(matchId)?.bagTotal ?? 0);
+
+  const t0 = Date.now();
   const amount = decideBid({
     letter,
     myBalance: participant.balance,
-    myRack: rackForMatch(conn, matchId),
-    dictionary: DICTIONARY,
-    auctionType,
-    participantCount,
-    auctionIndex: auctionCountByMatch.get(String(matchId)) ?? 0,
+    myRack,
+    trie: TRIE,
+    bagRemaining,
+    bagTotal,
+    numParticipants,
   });
+  const elapsed = Date.now() - t0;
+
   if (amount <= 0) return;
+
   conn.reducers.submitBid({ auctionId, amount: BigInt(amount) }).catch((err: Error) => {
     console.warn(`[${BOT_NAME}] bid rejected (match ${matchId}, auction ${auctionId}): ${err.message}`);
   });
   bidsByAuction.add(key);
   console.log(
-    `[${BOT_NAME}] bid ${amount} on '${letter}' (match ${matchId}, auction ${auctionId})`,
+    `[${BOT_NAME}] bid ${amount} on '${letter}' (match ${matchId}, auction ${auctionId}, ${elapsed}ms)`,
   );
 }
 
@@ -136,14 +204,9 @@ function tryPlayWord(conn: DbConnection) {
     const key = String(matchId);
     if (now - (lastWordAttemptByMatch.get(key) ?? 0) < WORD_RETRY_MS) continue;
     lastWordAttemptByMatch.set(key, now);
-    const rack = rackForMatch(conn, matchId);
-    const rackSize = Array.from(rack.values()).reduce((a, n) => a + n, 0);
-    // If rack is full, accept any playable word to unblock bidding.
-    const minScore = rackSize >= MAX_RACK_LETTERS ? 0 : MIN_WORD_SCORE;
     const word = chooseWord({
-      myRack: rack,
-      dictionary: DICTIONARY,
-      minScore,
+      myRack: rackForMatch(conn, matchId),
+      trie: TRIE,
     });
     if (!word) continue;
     console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
@@ -163,13 +226,11 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     .onApplied(() => {
       console.log(`[${BOT_NAME}] subscription applied`);
 
-      // Resolve our bot id, possibly after claiming a nonce.
       myBotId = resolveMyBotId(conn);
       if (myBotId === null) {
         if (BOT_NONCE) {
           console.log(`[${BOT_NAME}] claiming credential with nonce…`);
           conn.reducers.claimCredential({ code: BOT_NONCE });
-          // Wait briefly for the credential to land; check again.
           setTimeout(() => {
             myBotId = resolveMyBotId(conn);
             if (myBotId === null) {
@@ -215,33 +276,31 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     if (matchState?.status.tag !== "Running") return;
     tryBid(conn, a.id, a.matchId, a.letter);
   });
+
   conn.db.my_rack.onInsert(() => tryPlayWord(conn));
   conn.db.my_rack.onUpdate(() => tryPlayWord(conn));
+
   conn.db.bot_credential.onInsert(() => {
     if (myBotId === null) myBotId = resolveMyBotId(conn);
   });
+
   conn.db.auction_result.onInsert((_ctx, r) => {
     if (myBotId === null) return;
-    const matchState = conn.db.match_state.id.find(r.matchId);
-    if (matchState?.status.tag !== "Running") return;
-    const matchKey = String(r.matchId);
-    auctionCountByMatch.set(matchKey, (auctionCountByMatch.get(matchKey) ?? 0) + 1);
     const winner =
       r.winnerBotId !== undefined && r.winnerBotId !== null
         ? String(r.winnerBotId)
         : "no-bid";
     console.log(
-      `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} paid ${r.paid} (auction #${auctionCountByMatch.get(matchKey)})`,
+      `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} paid ${r.paid}`,
     );
-    // Bid on the next open auction immediately — N+1 may already be in the
-    // local table as part of the same server transaction batch, before the
-    // separate auction.onInsert event fires.
+    // The next auction may already be in the local table as part of the same
+    // server transaction batch — bid on it immediately without waiting for
+    // a separate auction.onInsert event.
     for (const a of conn.db.auction.iter()) {
       if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
     }
   });
 
-  // When a match this bot was in ends, hop back into the lobby.
   conn.db.match_state.onUpdate((_ctx, old, neu) => {
     if (myBotId === null) return;
     if (old.status.tag !== "Ended" && neu.status.tag === "Ended") {
@@ -250,7 +309,6 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       );
       if (wasIn) {
         console.log(`[${BOT_NAME}] match ${neu.id} ended; rejoining lobby`);
-        auctionCountByMatch.delete(String(neu.id));
         joinLobby(conn);
       }
     }
