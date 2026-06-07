@@ -206,10 +206,22 @@ export function decideBid(ctx: BidContext): number {
 export interface WordContext {
   myRack: Map<string, number>;
   trie: TrieNode;
+  bagRemaining: Map<string, number>; // for hold-vs-play MC check
+  bagTotal: number;
+  myBalance: number;
 }
 
 const TOP_K_WORDS = 20;
-const LEAVE_DISCOUNT = 0.5; // discount on leave value — future plays are uncertain
+const LEAVE_DISCOUNT = 0.5;  // discount on leave value — future plays are uncertain
+const N_HOLD_SIMS = 50;      // MC sims for hold estimate
+const K_HOLD = 3;            // letters drawn per hold sim
+const PLAY_FACTOR_BASE = 0.6; // early-game: play only if current ≥ 60% of expected future
+const LOW_BALANCE = 15;       // below this coins, lower the hold threshold
+
+// Approximate bag size at match start (98 total − 5 starting tiles per bot;
+// with 6 bots that's 68, but opponents' starting tiles are unknown so we use
+// 93 as a conservative approximation for the progress denominator).
+const INITIAL_BAG_APPROX = 93;
 
 export function chooseWord(ctx: WordContext): string | null {
   const rack: Record<string, number> = {};
@@ -219,7 +231,7 @@ export function chooseWord(ctx: WordContext): string | null {
   collectPlayable(ctx.trie, rack, "", playable);
   if (playable.length === 0) return null;
 
-  // Sort by raw reward, then evaluate top-K candidates with leave value.
+  // Sort by raw reward, evaluate top-K candidates with leave value.
   playable.sort((a, b) => b.reward - a.reward);
   const candidates = playable.slice(0, TOP_K_WORDS);
 
@@ -227,18 +239,36 @@ export function chooseWord(ctx: WordContext): string | null {
   let bestAdjusted = -1;
 
   for (const { word, reward } of candidates) {
-    // Build leave rack (letters remaining after playing this word).
     const leave: Record<string, number> = { ...rack };
     for (const ch of word) leave[ch]!--;
-
     const leaveVal = bestReward(ctx.trie, leave, 0);
     const adjusted = reward + LEAVE_DISCOUNT * leaveVal;
-
     if (adjusted > bestAdjusted) {
       bestAdjusted = adjusted;
       bestWord = word;
     }
   }
+
+  // ---------- Hold-vs-play MC check ----------
+  // Estimate the expected reward if we hold current tiles and draw more letters.
+  // Only play now if bestAdjusted meets the dynamic threshold.
+  const lookahead = Math.min(ctx.bagTotal, K_HOLD);
+  let futureSum = 0;
+  for (let i = 0; i < N_HOLD_SIMS; i++) {
+    const drawn = sampleFromBag(ctx.bagRemaining, ctx.bagTotal, lookahead);
+    const futureRack: Record<string, number> = { ...rack };
+    for (const l of drawn) futureRack[l] = (futureRack[l] ?? 0) + 1;
+    futureSum += bestReward(ctx.trie, futureRack, 0);
+  }
+  const expectedFuture = futureSum / N_HOLD_SIMS;
+
+  // playFactor rises from PLAY_FACTOR_BASE → 1.0 as the bag empties.
+  const bagProgress = Math.min(1, 1 - ctx.bagTotal / INITIAL_BAG_APPROX);
+  let playFactor = PLAY_FACTOR_BASE + (1 - PLAY_FACTOR_BASE) * bagProgress;
+  // Lower the bar if balance is running low — need to earn coins to keep bidding.
+  if (ctx.myBalance < LOW_BALANCE) playFactor *= 0.75;
+
+  if (bestAdjusted < expectedFuture * playFactor) return null; // hold
 
   return bestWord;
 }

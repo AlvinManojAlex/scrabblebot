@@ -204,9 +204,21 @@ function tryPlayWord(conn: DbConnection) {
     const key = String(matchId);
     if (now - (lastWordAttemptByMatch.get(key) ?? 0) < WORD_RETRY_MS) continue;
     lastWordAttemptByMatch.set(key, now);
+
+    const myRack = rackForMatch(conn, matchId);
+    const participant = participantForMatch(conn, matchId);
+    const numParticipants = Array.from(conn.db.match_participant.iter()).filter(
+      (p) => p.matchId === matchId,
+    ).length;
+    const bagRemaining = computeBagRemaining(conn, matchId, myRack, numParticipants);
+    const bagTotal = Number(conn.db.match_state.id.find(matchId)?.bagTotal ?? 0);
+
     const word = chooseWord({
-      myRack: rackForMatch(conn, matchId),
+      myRack,
       trie: TRIE,
+      bagRemaining,
+      bagTotal,
+      myBalance: participant?.balance ?? 0,
     });
     if (!word) continue;
     console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
