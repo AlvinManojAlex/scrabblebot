@@ -160,9 +160,13 @@ export interface BidContext {
 }
 
 const NUM_SIMS = 150;
-const MAX_LOOKAHEAD = 4;   // future letters sampled per simulation
+const MAX_LOOKAHEAD = 4;    // future letters sampled per simulation
 const BUDGET_FRACTION = 0.25;
-const BALANCE_FLOOR = 5;   // keep at least this many coins in reserve
+const BALANCE_FLOOR = 5;    // keep at least this many coins in reserve
+// Always bid at least this fraction of balance (up to the cap) to stay
+// competitive — MC marginal values converge low with a rich starting rack.
+const COMPETITIVE_FLOOR_FRACTION = 0.10;
+const COMPETITIVE_FLOOR_CAP = 10;
 
 export function decideBid(ctx: BidContext): number {
   if (ctx.myBalance <= 0) return 0;
@@ -219,7 +223,15 @@ export function decideBid(ctx: BidContext): number {
     Math.min(ctx.myBalance * BUDGET_FRACTION, ctx.myBalance - BALANCE_FLOOR),
   );
 
-  const raw = Math.round(Math.min(trueValue * scarcity, budgetCap));
+  // Competitive floor: always bid at least a fraction of balance so we stay
+  // in the market (MC marginal values can be systematically low when the
+  // starting rack is already letter-rich).
+  const competitiveFloor = Math.min(
+    Math.floor(ctx.myBalance * COMPETITIVE_FLOOR_FRACTION),
+    COMPETITIVE_FLOOR_CAP,
+  );
+  const effective = Math.max(trueValue * scarcity, competitiveFloor);
+  const raw = Math.round(Math.min(effective, budgetCap));
   if (raw < 1 && trueValue > 0 && ctx.myBalance > 0) return 1;
   return Math.max(0, Math.min(raw, ctx.myBalance));
 }
