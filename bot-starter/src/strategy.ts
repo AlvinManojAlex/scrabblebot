@@ -163,10 +163,14 @@ const NUM_SIMS = 150;
 const MAX_LOOKAHEAD = 4;    // future letters sampled per simulation
 const BUDGET_FRACTION = 0.25;
 const BALANCE_FLOOR = 5;    // keep at least this many coins in reserve
-// Always bid at least this fraction of balance (up to the cap) to stay
-// competitive — MC marginal values converge low with a rich starting rack.
-const COMPETITIVE_FLOOR_FRACTION = 0.10;
-const COMPETITIVE_FLOOR_CAP = 10;
+// Clamped fractional floors — start high early game, decay smoothly, never
+// drop below the minimum. budgetCap (balance × 0.25) takes over when very low.
+const VOWEL_FLOOR_MAX      = 15;  // ceiling — rises above 13 when balance is high (post word-play)
+const VOWEL_FLOOR_MIN      = 10;  // mid/late-game guarantee
+const VOWEL_FLOOR_FRAC     = 0.13;
+const CONSONANT_FLOOR_MAX  = 11;
+const CONSONANT_FLOOR_MIN  = 7;
+const CONSONANT_FLOOR_FRAC = 0.09;
 
 export function decideBid(ctx: BidContext): number {
   if (ctx.myBalance <= 0) return 0;
@@ -226,10 +230,9 @@ export function decideBid(ctx: BidContext): number {
   // Competitive floor: always bid at least a fraction of balance so we stay
   // in the market (MC marginal values can be systematically low when the
   // starting rack is already letter-rich).
-  const competitiveFloor = Math.min(
-    Math.floor(ctx.myBalance * COMPETITIVE_FLOOR_FRACTION),
-    COMPETITIVE_FLOOR_CAP,
-  );
+  const competitiveFloor = isVowel
+    ? Math.max(VOWEL_FLOOR_MIN, Math.min(VOWEL_FLOOR_MAX, Math.floor(ctx.myBalance * VOWEL_FLOOR_FRAC)))
+    : Math.max(CONSONANT_FLOOR_MIN, Math.min(CONSONANT_FLOOR_MAX, Math.floor(ctx.myBalance * CONSONANT_FLOOR_FRAC)));
   const effective = Math.max(trueValue * scarcity, competitiveFloor);
   const raw = Math.round(Math.min(effective, budgetCap));
   if (raw < 1 && trueValue > 0 && ctx.myBalance > 0) return 1;
