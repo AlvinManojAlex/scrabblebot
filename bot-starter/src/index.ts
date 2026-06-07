@@ -105,8 +105,8 @@ function participantForMatch(
 }
 
 // Estimates per-letter tile counts remaining in the bag for a given match.
-// Uses public auction_result + our own rack + a proportional estimate for
-// opponents' hidden starting racks.
+// Does not use auction_result (avoided to prevent historical data flood on startup).
+// Subtracts: current open auction letter + our own rack + proportional opponent racks.
 function computeBagRemaining(
   conn: DbConnection,
   matchId: bigint,
@@ -115,18 +115,7 @@ function computeBagRemaining(
 ): Map<string, number> {
   const bag: Record<string, number> = { ...DEFAULT_BAG };
 
-  // Subtract letters that were WON at auction.
-  // CRITICAL: winnerBotId === null means the letter was returned to the bag
-  // (return_to_bag on the server). Do NOT subtract those.
-  for (const r of conn.db.auction_result.iter()) {
-    if (r.matchId !== matchId) continue;
-    if (r.winnerBotId !== null && r.winnerBotId !== undefined) {
-      bag[r.letter] = (bag[r.letter] ?? 0) - 1;
-    }
-  }
-
-  // Subtract the currently open auction letter — it has been drawn from the
-  // bag but is not yet in auction_result.
+  // Subtract the currently open auction letter (drawn from bag, not yet settled).
   for (const a of conn.db.auction.iter()) {
     if (a.matchId !== matchId) continue;
     if (a.status.tag === "Open") {
@@ -139,8 +128,7 @@ function computeBagRemaining(
     bag[letter] = (bag[letter] ?? 0) - count;
   }
 
-  // Estimate opponents' starting tiles (5 per bot). We can't see their hands,
-  // so subtract proportionally to the original distribution.
+  // Estimate opponents' starting tiles (5 per bot) proportionally.
   const numOthers = Math.max(0, numParticipants - 1);
   const unknownTiles = numOthers * STARTING_RACK_SIZE;
   const bagTotal98 = 98;
@@ -274,7 +262,6 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       "SELECT * FROM match_state",
       "SELECT * FROM match_participant",
       "SELECT * FROM auction",
-      "SELECT * FROM auction_result",
       "SELECT * FROM my_rack",
       "SELECT * FROM bot_credential",
       "SELECT * FROM bot",
@@ -296,22 +283,6 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     if (myBotId === null) myBotId = resolveMyBotId(conn);
   });
 
-  conn.db.auction_result.onInsert((_ctx, r) => {
-    if (myBotId === null) return;
-    const winner =
-      r.winnerBotId !== undefined && r.winnerBotId !== null
-        ? String(r.winnerBotId)
-        : "no-bid";
-    console.log(
-      `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} paid ${r.paid}`,
-    );
-    // The next auction may already be in the local table as part of the same
-    // server transaction batch — bid on it immediately without waiting for
-    // a separate auction.onInsert event.
-    for (const a of conn.db.auction.iter()) {
-      if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
-    }
-  });
 
   conn.db.match_state.onUpdate((_ctx, old, neu) => {
     if (myBotId === null) return;
@@ -345,7 +316,9 @@ function joinLobby(conn: DbConnection) {
     );
   if (alreadyIn) return;
   console.log(`[${BOT_NAME}] joining lobby`);
-  conn.reducers.joinLobby({});
+  conn.reducers.joinLobby({}).catch((err: Error) => {
+    console.log(`[${BOT_NAME}] lobby join skipped: ${err.message}`);
+  });
 }
 
 function bootstrapActivity(conn: DbConnection) {
