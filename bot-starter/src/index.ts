@@ -22,7 +22,7 @@ import {
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { chooseWord, decideBid } from "./strategy.js";
+import { chooseWord, decideBid, MIN_WORD_SCORE, MAX_RACK_LETTERS } from "./strategy.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -62,6 +62,7 @@ let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
 const bidsByAuction = new Set<string>();
 const lastWordAttemptByMatch = new Map<string, number>();
+const auctionCountByMatch = new Map<string, number>();
 const WORD_RETRY_MS = 500;
 
 function resolveMyBotId(conn: DbConnection): bigint | null {
@@ -98,13 +99,24 @@ function tryBid(conn: DbConnection, auctionId: bigint, matchId: bigint, letter: 
   if (bidsByAuction.has(key)) return;
   const participant = participantForMatch(conn, matchId);
   if (!participant) return;
+  const matchState = conn.db.match_state.id.find(matchId);
+  const auctionType = matchState?.auctionType.tag === "FirstPrice" ? "FirstPrice" : "Vickrey";
+  const participantCount = Array.from(conn.db.match_participant.iter()).filter(
+    (p) => p.matchId === matchId,
+  ).length;
   const amount = decideBid({
     letter,
     myBalance: participant.balance,
     myRack: rackForMatch(conn, matchId),
+    dictionary: DICTIONARY,
+    auctionType,
+    participantCount,
+    auctionIndex: auctionCountByMatch.get(String(matchId)) ?? 0,
   });
   if (amount <= 0) return;
-  conn.reducers.submitBid({ auctionId, amount: BigInt(amount) });
+  conn.reducers.submitBid({ auctionId, amount: BigInt(amount) }).catch((err: Error) => {
+    console.warn(`[${BOT_NAME}] bid rejected (match ${matchId}, auction ${auctionId}): ${err.message}`);
+  });
   bidsByAuction.add(key);
   console.log(
     `[${BOT_NAME}] bid ${amount} on '${letter}' (match ${matchId}, auction ${auctionId})`,
@@ -119,16 +131,25 @@ function tryPlayWord(conn: DbConnection) {
   }
   const now = Date.now();
   for (const matchId of matches) {
+    const state = conn.db.match_state.id.find(matchId);
+    if (state?.status.tag !== "Running") continue;
     const key = String(matchId);
     if (now - (lastWordAttemptByMatch.get(key) ?? 0) < WORD_RETRY_MS) continue;
     lastWordAttemptByMatch.set(key, now);
+    const rack = rackForMatch(conn, matchId);
+    const rackSize = Array.from(rack.values()).reduce((a, n) => a + n, 0);
+    // If rack is full, accept any playable word to unblock bidding.
+    const minScore = rackSize >= MAX_RACK_LETTERS ? 0 : MIN_WORD_SCORE;
     const word = chooseWord({
-      myRack: rackForMatch(conn, matchId),
+      myRack: rack,
       dictionary: DICTIONARY,
+      minScore,
     });
     if (!word) continue;
     console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
-    conn.reducers.submitWord({ matchId, word });
+    conn.reducers.submitWord({ matchId, word }).catch((err: Error) => {
+      console.warn(`[${BOT_NAME}] word rejected (match ${matchId}, '${word}'): ${err.message}`);
+    });
   }
 }
 
@@ -176,10 +197,23 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       console.log(`[${BOT_NAME}] acting as bot '${bot?.name ?? "?"}' (id ${myBotId})`);
       bootstrapActivity(conn);
     })
-    .subscribeToAllTables();
+    .subscribe([
+      "SELECT * FROM match_state",
+      "SELECT * FROM match_participant",
+      "SELECT * FROM auction",
+      "SELECT * FROM auction_result",
+      "SELECT * FROM my_rack",
+      "SELECT * FROM bot_credential",
+      "SELECT * FROM bot",
+      "SELECT * FROM lobby",
+      "SELECT * FROM lobby_member",
+    ]);
 
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
-    if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
+    if (a.status.tag !== "Open") return;
+    const matchState = conn.db.match_state.id.find(a.matchId);
+    if (matchState?.status.tag !== "Running") return;
+    tryBid(conn, a.id, a.matchId, a.letter);
   });
   conn.db.my_rack.onInsert(() => tryPlayWord(conn));
   conn.db.my_rack.onUpdate(() => tryPlayWord(conn));
@@ -188,13 +222,23 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   });
   conn.db.auction_result.onInsert((_ctx, r) => {
     if (myBotId === null) return;
+    const matchState = conn.db.match_state.id.find(r.matchId);
+    if (matchState?.status.tag !== "Running") return;
+    const matchKey = String(r.matchId);
+    auctionCountByMatch.set(matchKey, (auctionCountByMatch.get(matchKey) ?? 0) + 1);
     const winner =
       r.winnerBotId !== undefined && r.winnerBotId !== null
         ? String(r.winnerBotId)
         : "no-bid";
     console.log(
-      `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} paid ${r.paid}`,
+      `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} paid ${r.paid} (auction #${auctionCountByMatch.get(matchKey)})`,
     );
+    // Bid on the next open auction immediately — N+1 may already be in the
+    // local table as part of the same server transaction batch, before the
+    // separate auction.onInsert event fires.
+    for (const a of conn.db.auction.iter()) {
+      if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
+    }
   });
 
   // When a match this bot was in ends, hop back into the lobby.
@@ -206,6 +250,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       );
       if (wasIn) {
         console.log(`[${BOT_NAME}] match ${neu.id} ended; rejoining lobby`);
+        auctionCountByMatch.delete(String(neu.id));
         joinLobby(conn);
       }
     }
