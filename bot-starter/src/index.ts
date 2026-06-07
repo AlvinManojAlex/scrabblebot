@@ -23,6 +23,7 @@ import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { buildTrie, chooseWord, decideBid, type TrieNode } from "./strategy.js";
+// Volume-bidder branch: MC removed, no bag tracking needed for bidding.
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -74,6 +75,7 @@ let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
 const bidsByAuction = new Set<string>();
 const lastWordAttemptByMatch = new Map<string, number>();
+const turnsHeldByMatch = new Map<string, number>(); // consecutive holds per match
 const WORD_RETRY_MS = 500;
 
 function resolveMyBotId(conn: DbConnection): bigint | null {
@@ -161,24 +163,11 @@ function tryBid(conn: DbConnection, auctionId: bigint, matchId: bigint, letter: 
   const participant = participantForMatch(conn, matchId);
   if (!participant) return;
 
-  const myRack = rackForMatch(conn, matchId);
-  const numParticipants = Array.from(conn.db.match_participant.iter()).filter(
-    (p) => p.matchId === matchId,
-  ).length;
-  const bagRemaining = computeBagRemaining(conn, matchId, myRack, numParticipants);
-  const bagTotal = Number(conn.db.match_state.id.find(matchId)?.bagTotal ?? 0);
-
-  const t0 = Date.now();
   const amount = decideBid({
     letter,
     myBalance: participant.balance,
-    myRack,
-    trie: TRIE,
-    bagRemaining,
-    bagTotal,
-    numParticipants,
+    myRack: rackForMatch(conn, matchId),
   });
-  const elapsed = Date.now() - t0;
 
   if (amount <= 0) return;
 
@@ -186,9 +175,7 @@ function tryBid(conn: DbConnection, auctionId: bigint, matchId: bigint, letter: 
     console.warn(`[${BOT_NAME}] bid rejected (match ${matchId}, auction ${auctionId}): ${err.message}`);
   });
   bidsByAuction.add(key);
-  console.log(
-    `[${BOT_NAME}] bid ${amount} on '${letter}' (match ${matchId}, auction ${auctionId}, ${elapsed}ms)`,
-  );
+  console.log(`[${BOT_NAME}] bid ${amount} on '${letter}' (match ${matchId}, auction ${auctionId})`);
 }
 
 function tryPlayWord(conn: DbConnection) {
@@ -207,21 +194,26 @@ function tryPlayWord(conn: DbConnection) {
 
     const myRack = rackForMatch(conn, matchId);
     const participant = participantForMatch(conn, matchId);
-    const numParticipants = Array.from(conn.db.match_participant.iter()).filter(
-      (p) => p.matchId === matchId,
-    ).length;
-    const bagRemaining = computeBagRemaining(conn, matchId, myRack, numParticipants);
     const bagTotal = Number(conn.db.match_state.id.find(matchId)?.bagTotal ?? 0);
+    const turnsHeld = turnsHeldByMatch.get(key) ?? 0;
 
     const word = chooseWord({
       myRack,
       trie: TRIE,
-      bagRemaining,
-      bagTotal,
       myBalance: participant?.balance ?? 0,
+      bagTotal,
+      turnsHeld,
     });
-    if (!word) continue;
-    console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
+
+    if (!word) {
+      // Increment held counter only when rack has tiles (genuine hold decision).
+      const rackSize = [...myRack.values()].reduce((s, c) => s + c, 0);
+      if (rackSize > 0) turnsHeldByMatch.set(key, turnsHeld + 1);
+      continue;
+    }
+
+    turnsHeldByMatch.set(key, 0); // reset on play
+    console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}' (held ${turnsHeld} turns)`);
     conn.reducers.submitWord({ matchId, word }).catch((err: Error) => {
       console.warn(`[${BOT_NAME}] word rejected (match ${matchId}, '${word}'): ${err.message}`);
     });
@@ -321,6 +313,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       );
       if (wasIn) {
         console.log(`[${BOT_NAME}] match ${neu.id} ended; rejoining lobby`);
+        turnsHeldByMatch.delete(String(neu.id));
         joinLobby(conn);
       }
     }

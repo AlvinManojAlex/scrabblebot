@@ -1,8 +1,10 @@
-// Optimal Vickrey bidding strategy using a trie + Monte Carlo simulation.
+// Volume-bidder strategy — modelled on observed bot 13 behaviour.
 //
-// Dominant strategy in a Vickrey (second-price) auction: bid your TRUE value.
-// True value = expected marginal score gain from acquiring this letter,
-// estimated via Monte Carlo sampling over future bag draws.
+// Key principles:
+// 1. Bid a fixed competitive amount on every auction (vowels: 12, consonants: 10,
+//    high-value letters: face_value + 3). No MC simulation — fast, predictable.
+// 2. Play the highest-scoring available word immediately, no hold check.
+//    Cash velocity > waiting for perfect words.
 
 export const LETTER_VALUE: Record<string, number> = {
   A: 1, B: 3, C: 3, D: 2, E: 1, F: 4, G: 2, H: 4, I: 1, J: 8,
@@ -12,12 +14,7 @@ export const LETTER_VALUE: Record<string, number> = {
 
 const VOWELS = new Set(['A', 'E', 'I', 'O', 'U']);
 
-// Rack balance — bidding adjustments when vowel/consonant ratio is off.
-const CONSONANT_PENALTY = 0.3; // suppress consonant bids when rack is vowel-deficient
-const VOWEL_BOOST       = 1.5; // boost vowel bids when rack has zero vowels
-
 // Matches Rust's integer arithmetic in length_multiplier() exactly.
-// 4-letter: floor(base * 3/2), 6-letter: floor(base * 5/2)
 export function computeTotalReward(word: string): number {
   const base = [...word].reduce((s, c) => s + (LETTER_VALUE[c] ?? 0), 0);
   const len = word.length;
@@ -25,16 +22,14 @@ export function computeTotalReward(word: string): number {
   if (len === 4) return Math.floor((base * 3) / 2);
   if (len === 5) return base * 2;
   if (len === 6) return Math.floor((base * 5) / 2);
-  return base * 3; // 7+
+  return base * 3;
 }
 
-// ---------- Trie ----------
+// ---------- Trie (kept for word selection) ----------
 
 export interface TrieNode {
   children: Map<string, TrieNode>;
-  // Max total_reward reachable anywhere in this subtree — used to prune DFS.
   maxSubtreeReward: number;
-  // Reward if a valid word ends exactly at this node, otherwise null.
   wordReward: number | null;
 }
 
@@ -57,7 +52,6 @@ export function buildTrie(dictionary: string[]): TrieNode {
     }
     node.wordReward = reward;
   }
-  // Propagate maxSubtreeReward bottom-up via post-order DFS.
   function propagate(node: TrieNode): number {
     let max = node.wordReward ?? 0;
     for (const child of node.children.values()) {
@@ -70,29 +64,6 @@ export function buildTrie(dictionary: string[]): TrieNode {
   return root;
 }
 
-// Returns the highest total_reward of any word playable from `rack`.
-// Mutates rack counts in-place during recursion and restores them — the caller
-// must not share the same object across concurrent invocations.
-function bestReward(
-  node: TrieNode,
-  rack: Record<string, number>,
-  best: number,
-): number {
-  if (node.wordReward !== null && node.wordReward > best) {
-    best = node.wordReward;
-  }
-  for (const [letter, child] of node.children) {
-    // Skip branch if no tiles available or subtree can't beat current best.
-    if ((rack[letter] ?? 0) > 0 && child.maxSubtreeReward > best) {
-      rack[letter]!--;
-      best = bestReward(child, rack, best);
-      rack[letter]!++;
-    }
-  }
-  return best;
-}
-
-// Collects all playable {word, reward} pairs — used by chooseWord.
 function collectPlayable(
   node: TrieNode,
   rack: Record<string, number>,
@@ -111,132 +82,70 @@ function collectPlayable(
   }
 }
 
-// ---------- Bag sampling ----------
-
-// Weighted sampling without replacement from the estimated remaining bag.
-function sampleFromBag(
-  bagRemaining: Map<string, number>,
-  bagTotal: number,
-  k: number,
-): string[] {
-  if (bagTotal <= 0 || k <= 0) return [];
-
-  // Materialise into parallel arrays for cheap mutation.
-  const letters: string[] = [];
-  const counts: number[] = [];
-  for (const [l, c] of bagRemaining) {
-    if (c > 0) { letters.push(l); counts.push(c); }
-  }
-
-  let total = bagTotal;
-  const result: string[] = [];
-
-  for (let i = 0; i < k; i++) {
-    if (total <= 0) break;
-    let r = Math.random() * total;
-    for (let j = 0; j < letters.length; j++) {
-      r -= counts[j]!;
-      if (r <= 0) {
-        result.push(letters[j]!);
-        counts[j]!--;
-        total--;
-        break;
-      }
-    }
-  }
-  return result;
-}
-
 // ---------- Bid ----------
 
 export interface BidContext {
   letter: string;
   myBalance: number;
   myRack: Map<string, number>;
-  trie: TrieNode;
-  bagRemaining: Map<string, number>; // estimated per-letter tile counts left in bag
-  bagTotal: number;                  // ground-truth total from match_state.bagTotal
-  numParticipants: number;
 }
 
-const NUM_SIMS = 150;
-const MAX_LOOKAHEAD = 4;    // future letters sampled per simulation
-const BUDGET_FRACTION = 0.25;
-const BALANCE_FLOOR = 5;    // keep at least this many coins in reserve
-// Clamped fractional floors — start high early game, decay smoothly, never
-// drop below the minimum. budgetCap (balance × 0.25) takes over when very low.
-const VOWEL_FLOOR_MAX      = 15;  // ceiling — rises above 13 when balance is high (post word-play)
-const VOWEL_FLOOR_MIN      = 10;  // mid/late-game guarantee
-const VOWEL_FLOOR_FRAC     = 0.13;
-const CONSONANT_FLOOR_MAX  = 11;
-const CONSONANT_FLOOR_MIN  = 7;
-const CONSONANT_FLOOR_FRAC = 0.09;
+// Fixed bid tiers — competitive across the full match without MC overhead.
+const VOWEL_BID       = 14; // bid this on every vowel
+const CONSONANT_BID   = 12; // bid this on common consonants
+const HIGHVAL_PREMIUM =  3; // added on top of face value for J/X/Q/Z/K (value ≥ 5)
+const BUDGET_FRACTION = 0.30; // spend up to 30% of balance per auction
+const BALANCE_FLOOR   =  3;  // keep at least this many coins
+// Duplicate penalty: halve bid when already holding ≥1 of a letter,
+// except E (27% of words have duplicate E) and S (20%) where multiples stay useful.
+const DUPLICATE_EXEMPT  = new Set(['E', 'S']);
+const DUPLICATE_PENALTY = 0.5;
 
 export function decideBid(ctx: BidContext): number {
   if (ctx.myBalance <= 0) return 0;
 
-  const lookahead = Math.min(ctx.bagTotal, MAX_LOOKAHEAD);
+  const isVowel = VOWELS.has(ctx.letter);
+  const value   = LETTER_VALUE[ctx.letter] ?? 1;
 
-  const baseRack: Record<string, number> = {};
-  for (const [l, c] of ctx.myRack) baseRack[l] = c;
-
-  let marginalSum = 0;
-
-  for (let i = 0; i < NUM_SIMS; i++) {
-    const drawn = sampleFromBag(ctx.bagRemaining, ctx.bagTotal, lookahead);
-
-    // Rack with the auctioned letter + future draws.
-    const rackWith: Record<string, number> = { ...baseRack };
-    rackWith[ctx.letter] = (rackWith[ctx.letter] ?? 0) + 1;
-    for (const l of drawn) rackWith[l] = (rackWith[l] ?? 0) + 1;
-
-    // Rack with only the future draws (without the auctioned letter).
-    const rackWithout: Record<string, number> = { ...baseRack };
-    for (const l of drawn) rackWithout[l] = (rackWithout[l] ?? 0) + 1;
-
-    marginalSum +=
-      bestReward(ctx.trie, rackWith, 0) -
-      bestReward(ctx.trie, rackWithout, 0);
+  // Tier 1: high-value rare letters (J=8, X=8, Q=10, Z=10, K=5)
+  // Tier 2: vowels — always bid competitively
+  // Tier 3: common consonants
+  let bid: number;
+  if (value >= 5) {
+    bid = value + HIGHVAL_PREMIUM; // J→11, K→8, X→11, Q→13, Z→13
+  } else if (isVowel) {
+    bid = VOWEL_BID;
+  } else {
+    bid = CONSONANT_BID;
   }
 
-  let trueValue = marginalSum / NUM_SIMS;
-
-  // Rack balance: adjust bid based on vowel/consonant ratio.
-  // If the rack is consonant-heavy, additional consonants are nearly useless
-  // without vowels to pair them with; vowels become urgently needed.
+  // Rack balance: if we have far too many consonants and no vowels,
+  // suppress more consonant bids and boost vowels.
   const vowelCount = [...ctx.myRack.entries()]
     .filter(([l]) => VOWELS.has(l))
     .reduce((s, [, c]) => s + c, 0);
   const rackSize = [...ctx.myRack.values()].reduce((s, c) => s + c, 0);
-  const isVowel = VOWELS.has(ctx.letter);
   if (rackSize >= 2) {
     const vowelRatio = vowelCount / rackSize;
     if (!isVowel && vowelRatio < 0.2) {
-      trueValue *= CONSONANT_PENALTY; // far too many consonants already
+      bid = Math.round(bid * 0.4); // consonant-heavy: back off consonants
     } else if (isVowel && vowelCount === 0) {
-      trueValue *= VOWEL_BOOST;       // no vowels at all — urgently need one
+      bid = Math.round(bid * 1.4); // no vowels: urgently bid higher
     }
   }
 
-  // Scarcity premium: fewer remaining tiles → fewer future chances → bid more.
-  const remaining = ctx.bagRemaining.get(ctx.letter) ?? 0;
-  const scarcity = 1 + 1 / (remaining + 1);
+  // Duplicate penalty: already have ≥1 of this letter and it's not in the exempt set.
+  const currentCount = ctx.myRack.get(ctx.letter) ?? 0;
+  if (currentCount >= 1 && !DUPLICATE_EXEMPT.has(ctx.letter)) {
+    bid = Math.round(bid * DUPLICATE_PENALTY);
+  }
 
-  const budgetCap = Math.max(
-    0,
-    Math.min(ctx.myBalance * BUDGET_FRACTION, ctx.myBalance - BALANCE_FLOOR),
-  );
+  const budgetCap = Math.max(0, Math.min(
+    ctx.myBalance * BUDGET_FRACTION,
+    ctx.myBalance - BALANCE_FLOOR,
+  ));
 
-  // Competitive floor: always bid at least a fraction of balance so we stay
-  // in the market (MC marginal values can be systematically low when the
-  // starting rack is already letter-rich).
-  const competitiveFloor = isVowel
-    ? Math.max(VOWEL_FLOOR_MIN, Math.min(VOWEL_FLOOR_MAX, Math.floor(ctx.myBalance * VOWEL_FLOOR_FRAC)))
-    : Math.max(CONSONANT_FLOOR_MIN, Math.min(CONSONANT_FLOOR_MAX, Math.floor(ctx.myBalance * CONSONANT_FLOOR_FRAC)));
-  const effective = Math.max(trueValue * scarcity, competitiveFloor);
-  const raw = Math.round(Math.min(effective, budgetCap));
-  if (raw < 1 && trueValue > 0 && ctx.myBalance > 0) return 1;
-  return Math.max(0, Math.min(raw, ctx.myBalance));
+  return Math.max(0, Math.min(Math.round(bid), Math.floor(budgetCap)));
 }
 
 // ---------- Word ----------
@@ -244,17 +153,26 @@ export function decideBid(ctx: BidContext): number {
 export interface WordContext {
   myRack: Map<string, number>;
   trie: TrieNode;
-  bagRemaining: Map<string, number>;
-  bagTotal: number;
-  myBalance: number;
+  myBalance: number;  // triggers play when low
+  bagTotal: number;   // forces play near end of match
+  turnsHeld: number;  // consecutive holds without playing — forces play when high
 }
 
-const N_WORD_SIMS    = 40;  // MC simulations for hold-vs-play
-const K_WORD         = 3;   // letters drawn per simulation
-const MAX_CANDIDATES = 15;  // top words evaluated with MC (by raw reward)
-const LOW_BALANCE    = 15;  // below this coins, lower the hold threshold
+// Hold until balance is low, game is ending, or we've been stuck too long.
+const LOW_BALANCE_TRIGGER = 25; // play when balance drops below this
+const END_GAME_BAG        = 15; // force play when bag has fewer tiles than this
+const FORCE_PLAY_AFTER    =  5; // force play after this many consecutive holds
 
 export function chooseWord(ctx: WordContext): string | null {
+  // Hold unless one of the three exit conditions fires.
+  if (
+    ctx.myBalance >= LOW_BALANCE_TRIGGER &&
+    ctx.bagTotal > END_GAME_BAG &&
+    ctx.turnsHeld < FORCE_PLAY_AFTER
+  ) {
+    return null;
+  }
+
   const rack: Record<string, number> = {};
   for (const [l, c] of ctx.myRack) rack[l] = c;
 
@@ -262,53 +180,6 @@ export function chooseWord(ctx: WordContext): string | null {
   collectPlayable(ctx.trie, rack, "", playable);
   if (playable.length === 0) return null;
 
-  // Take top candidates by raw reward — they're the most likely winners.
   playable.sort((a, b) => b.reward - a.reward);
-  const candidates = playable.slice(0, MAX_CANDIDATES);
-
-  // Pre-generate shared simulation draws so all evaluations use the same futures.
-  const lookahead = Math.min(ctx.bagTotal, K_WORD);
-  const simDraws: string[][] = [];
-  for (let i = 0; i < N_WORD_SIMS; i++) {
-    simDraws.push(sampleFromBag(ctx.bagRemaining, ctx.bagTotal, lookahead));
-  }
-
-  // E[hold] = expected best reward from keeping ALL current tiles + future draws.
-  // This is the opportunity cost of playing any word.
-  let holdSum = 0;
-  for (const drawn of simDraws) {
-    const futureRack: Record<string, number> = { ...rack };
-    for (const l of drawn) futureRack[l] = (futureRack[l] ?? 0) + 1;
-    holdSum += bestReward(ctx.trie, futureRack, 0);
-  }
-  const expectedHold = holdSum / N_WORD_SIMS;
-
-  // For each candidate word W:
-  //   E[play(W)] = reward(W) + E[future(leave(W) + draws)]
-  // Play W if E[play(W)] > E[hold] — i.e., playing W beats holding everything.
-  let bestWord: string | null = null;
-  let bestPlayValue = -Infinity;
-
-  for (const { word, reward } of candidates) {
-    const leave: Record<string, number> = { ...rack };
-    for (const ch of word) leave[ch]!--;
-
-    let leaveSum = 0;
-    for (const drawn of simDraws) {
-      const futureLeave: Record<string, number> = { ...leave };
-      for (const l of drawn) futureLeave[l] = (futureLeave[l] ?? 0) + 1;
-      leaveSum += bestReward(ctx.trie, futureLeave, 0);
-    }
-    const playValue = reward + leaveSum / N_WORD_SIMS;
-
-    if (playValue > bestPlayValue) {
-      bestPlayValue = playValue;
-      bestWord = word;
-    }
-  }
-
-  // Lower hold threshold slightly when balance is low — need coins to keep bidding.
-  const holdThreshold = ctx.myBalance < LOW_BALANCE ? expectedHold * 0.85 : expectedHold;
-  if (bestPlayValue < holdThreshold) return null;
-  return bestWord;
+  return playable[0]?.word ?? null;
 }
